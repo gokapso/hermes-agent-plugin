@@ -1,0 +1,59 @@
+name: kapso-platform
+label: Kapso WhatsApp
+kind: platform
+version: 0.1.0
+description: >
+  Kapso WhatsApp gateway adapter for Hermes Agent. Receives Kapso platform
+  webhooks and sends replies through Kapso's WhatsApp Cloud API proxy.
+author: Kapso
+requires_env:
+  - name: KAPSO_API_KEY
+    description: "Kapso API key used for outbound WhatsApp sends"
+    prompt: "Kapso API key"
+    url: "https://kapso.ai/"
+    password: true
+  - name: KAPSO_WEBHOOK_SECRET
+    description: "Secret used to verify Kapso X-Webhook-Signature webhook deliveries"
+    prompt: "Kapso webhook secret"
+    password: true
+optional_env:
+  - name: KAPSO_PHONE_NUMBER_ID
+    description: "Default Kapso WhatsApp phone_number_id for outbound messages and cron delivery"
+    prompt: "Kapso phone_number_id"
+    password: false
+  - name: KAPSO_HOME_CHANNEL
+    description: "Default WhatsApp recipient number for deliver=kapso cron jobs"
+    prompt: "Home WhatsApp recipient"
+    password: false
+  - name: KAPSO_BASE_URL
+    description: "Kapso WhatsApp proxy base URL (default: https://api.kapso.ai/meta/whatsapp)"
+    prompt: "Kapso base URL"
+    password: false
+  - name: KAPSO_GRAPH_VERSION
+    description: "Meta Graph API version to use through Kapso (default: v24.0)"
+    prompt: "Graph API version"
+    password: false
+  - name: KAPSO_HOST
+    description: "Webhook bind host (default: 0.0.0.0)"
+    prompt: "Webhook host"
+    password: false
+  - name: KAPSO_PORT
+    description: "Webhook listen port (default: 8648)"
+    prompt: "Webhook port"
+    password: false
+  - name: KAPSO_WEBHOOK_PATH
+    description: "Webhook path (default: /kapso/webhook)"
+    prompt: "Webhook path"
+    password: false
+  - name: KAPSO_VERIFY_WEBHOOK_SIGNATURES
+    description: "Set false only for local unsigned webhook fixtures"
+    prompt: "Verify webhook signatures? (true/false)"
+    password: false
+  - name: KAPSO_ALLOWED_USERS
+    description: "Comma-separated WhatsApp user IDs allowed to talk to the bot"
+    prompt: "Allowed WhatsApp users"
+    password: false
+  - name: KAPSO_ALLOW_ALL_USERS
+    description: "Allow any WhatsApp user to talk to the bot (development only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
