@@ -217,6 +217,84 @@ def test_audio_transcript_and_media_description_text() -> None:
     )
 
 
+class FakeGetResponse:
+    def __init__(self, *, status=200, text="", body=b"", headers=None):
+        self.status = status
+        self._text = text
+        self._body = body
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def text(self):
+        return self._text
+
+    async def read(self):
+        return self._body
+
+
+class FakeMediaSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
+
+
+async def test_hydrates_image_media_into_hermes_cache(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_cache_image_bytes", lambda data, ext: f"/tmp/hermes-image{ext}")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                text=(
+                    '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=abc",'
+                    '"mime_type":"image/png"}'
+                )
+            ),
+            FakeGetResponse(
+                body=b"\x89PNG\r\n\x1a\npayload",
+                headers={"Content-Type": "image/png"},
+            ),
+        ]
+    )
+    payload = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.image",
+            "from": "15551234567",
+            "type": "image",
+            "image": {"id": "media-123", "mime_type": "image/png"},
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.media_urls == ["/tmp/hermes-image.png"]
+    assert message_event.media_types == ["image/png"]
+    assert kapso._session.calls[0] == (
+        "https://api.kapso.ai/meta/whatsapp/v24.0/media-123?phone_number_id=pn-123",
+        {"headers": {"X-API-Key": "key"}},
+    )
+    assert kapso._session.calls[1][0] == "https://api.kapso.ai/meta/whatsapp/media_download?token=abc"
+    assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
+
+
 def test_resolve_chat_id_accepts_encoded_and_plain_forms() -> None:
     kapso = adapter.KapsoAdapter(
         make_config(

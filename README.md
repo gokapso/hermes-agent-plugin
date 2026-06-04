@@ -187,6 +187,17 @@ hermes kapso status
 kapso whatsapp numbers list --output json
 ```
 
+If images do not reach the agent, tail the gateway logs while sending a photo:
+
+```bash
+journalctl --user -u hermes-gateway.service -f | grep -i kapso
+```
+
+Successful image ingestion logs `cached inbound image ...` and writes the file
+under `~/.hermes/cache/images`. If you only see `image message ... has no
+downloadable media URL yet`, confirm the webhook payload includes either
+`kapso.mediaUrl`/`kapso.media_url` or an image media `id`.
+
 ## Implementation Notes
 
 - `hermes plugins install ... --enable` prompts for `KAPSO_API_KEY` and
@@ -199,6 +210,6 @@ kapso whatsapp numbers list --output json
 - Text messages are split at WhatsApp's 4096-character limit.
 - Outbound Markdown links are converted to `label (url)`, and `**bold**` is
   converted to WhatsApp's `*bold*` style.
-- Media messages currently land as captions or descriptive placeholders. The
-  next useful extension is downloading `kapso.mediaUrl` into Hermes media
-  caches when Kapso includes mirrored media.
+- Inbound images are downloaded through Kapso, cached locally, and attached to
+  Hermes `MessageEvent.media_urls` for native vision processing.
+- Non-image media currently lands as captions or descriptive placeholders.

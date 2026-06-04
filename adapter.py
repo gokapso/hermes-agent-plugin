@@ -23,10 +23,12 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import OrderedDict
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit
 
 try:
     from aiohttp import ClientSession, ClientTimeout, web
@@ -46,6 +48,11 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+try:
+    from gateway.platforms.base import cache_image_from_bytes as _hermes_cache_image_from_bytes
+except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
+    _hermes_cache_image_from_bytes = None
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.kapso.ai/meta/whatsapp"
@@ -64,6 +71,13 @@ _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 _MD_BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
 _MD_UNDERLINE_BOLD_RE = re.compile(r"__([^_\n]+)__")
 _MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_IMAGE_MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
 
 
 class KapsoAdapter(BasePlatformAdapter):
@@ -330,6 +344,7 @@ class KapsoAdapter(BasePlatformAdapter):
             message_event = self._message_event_from_kapso_event(kapso_event)
             if message_event is None:
                 continue
+            await self._hydrate_media_event(message_event, kapso_event)
             if self._is_seen(message_event.message_id):
                 continue
             await self.handle_message(message_event)
@@ -397,6 +412,134 @@ class KapsoAdapter(BasePlatformAdapter):
             message_id=message_id,
             reply_to_message_id=_read_str(_record(message.get("context")), "id"),
             timestamp=_message_timestamp(message),
+        )
+
+    async def _hydrate_media_event(self, event: MessageEvent, kapso_event: Dict[str, Any]) -> None:
+        """Download inbound image media into Hermes' local cache for vision."""
+        if event.message_type != MessageType.PHOTO:
+            return
+        if getattr(event, "media_urls", None):
+            return
+        if not self._session:
+            return
+
+        message = _record(kapso_event.get("message"))
+        if message is None and _looks_like_whatsapp_message(kapso_event):
+            message = kapso_event
+        if not message:
+            return
+
+        media = _record(message.get("image"))
+        if not media:
+            return
+
+        media_url, mime_type = await self._resolve_media_download(kapso_event, message, media, "image")
+        if not media_url:
+            logger.info(
+                "[kapso] image message %s has no downloadable media URL yet",
+                event.message_id,
+            )
+            return
+
+        ext = _media_extension(media, mime_type)
+        try:
+            headers = _kapso_download_headers(media_url, self.api_key)
+            async with self._session.get(media_url, headers=headers) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    logger.warning(
+                        "[kapso] failed to download image media %s: HTTP %s %s",
+                        event.message_id,
+                        response.status,
+                        _compact(text),
+                    )
+                    return
+                data = await response.read()
+                content_type = response.headers.get("Content-Type", "")
+        except Exception as exc:
+            logger.warning("[kapso] failed to download image media %s: %s", event.message_id, exc)
+            return
+
+        if content_type:
+            ext = _media_extension({"mime_type": content_type}, content_type, default=ext)
+            mime_type = content_type.split(";", 1)[0].strip() or mime_type
+        try:
+            cached_path = _cache_image_bytes(data, ext)
+        except Exception as exc:
+            logger.warning("[kapso] failed to cache image media %s: %s", event.message_id, exc)
+            return
+
+        event.media_urls = [cached_path]
+        event.media_types = [mime_type or f"image/{ext.lstrip('.')}"]
+        logger.info("[kapso] cached inbound image %s at %s", event.message_id, cached_path)
+
+    async def _resolve_media_download(
+        self,
+        kapso_event: Dict[str, Any],
+        message: Dict[str, Any],
+        media: Dict[str, Any],
+        kind: str,
+    ) -> Tuple[str, str]:
+        kapso = _record(message.get("kapso")) or {}
+        media_data = _record(kapso.get("mediaData")) or _record(kapso.get("media_data")) or {}
+        direct_url = (
+            _read_str(kapso, "downloadUrl", "download_url", "mediaUrl", "media_url")
+            or _read_str(media_data, "downloadUrl", "download_url", "url", "mediaUrl", "media_url")
+            or _read_str(media, "link", "url")
+        )
+        mime_type = _read_str(media, "mime_type", "mimeType") or _read_str(
+            media_data,
+            "contentType",
+            "content_type",
+            "mime_type",
+            "mimeType",
+        )
+        if direct_url:
+            return direct_url, mime_type or ""
+
+        media_id = _read_str(media, "id")
+        if not media_id:
+            return "", mime_type or ""
+
+        phone_number_id = (
+            _read_str(kapso_event, "phone_number_id", "phoneNumberId")
+            or _read_str(message, "phone_number_id", "phoneNumberId")
+            or _read_str(kapso, "phoneNumberId", "phone_number_id")
+            or self.default_phone_number_id
+        )
+        if not phone_number_id:
+            logger.info("[kapso] cannot fetch %s media %s without phone_number_id", kind, media_id)
+            return "", mime_type or ""
+
+        metadata_url = _build_media_metadata_url(
+            self.base_url,
+            self.graph_version,
+            media_id,
+            phone_number_id,
+        )
+        try:
+            async with self._session.get(
+                metadata_url,
+                headers={"X-API-Key": self.api_key},
+            ) as response:
+                raw_text = await response.text()
+                if response.status >= 400:
+                    logger.warning(
+                        "[kapso] media metadata fetch failed for %s: HTTP %s %s",
+                        media_id,
+                        response.status,
+                        _compact(raw_text),
+                    )
+                    return "", mime_type or ""
+                metadata = json.loads(raw_text) if raw_text else {}
+        except Exception as exc:
+            logger.warning("[kapso] media metadata fetch failed for %s: %s", media_id, exc)
+            return "", mime_type or ""
+
+        record = _record(metadata) or {}
+        return (
+            _read_str(record, "downloadUrl", "download_url", "url") or "",
+            _read_str(record, "mime_type", "mimeType") or mime_type or "",
         )
 
     def _resolve_chat_id(self, chat_id: str) -> Optional[Tuple[Optional[str], str]]:
@@ -1059,6 +1202,59 @@ def _messages_url(base_url: str, graph_version: str, phone_number_id: str) -> st
     if not _GRAPH_VERSION_RE.search(base):
         base = f"{base}/{_strip_slashes(graph_version)}"
     return f"{base}/{quote(str(phone_number_id), safe='')}/messages"
+
+
+def _build_media_metadata_url(
+    base_url: str,
+    graph_version: str,
+    media_id: str,
+    phone_number_id: str,
+) -> str:
+    base = _normalize_base_url(base_url)
+    if not _GRAPH_VERSION_RE.search(base):
+        base = f"{base}/{_strip_slashes(graph_version)}"
+    query = urlencode({"phone_number_id": phone_number_id})
+    return f"{base}/{quote(str(media_id), safe='')}?{query}"
+
+
+def _kapso_download_headers(url: str, api_key: str) -> Dict[str, str]:
+    if not api_key:
+        return {}
+    try:
+        host = urlsplit(url).hostname or ""
+    except Exception:
+        host = ""
+    if host.lower().endswith("kapso.ai"):
+        return {"X-API-Key": api_key}
+    return {}
+
+
+def _media_extension(
+    media: Dict[str, Any],
+    mime_type: Optional[str],
+    *,
+    default: str = ".jpg",
+) -> str:
+    raw_mime = (mime_type or _read_str(media, "mime_type", "mimeType") or "").split(";", 1)[0]
+    ext = _IMAGE_MIME_EXTENSIONS.get(raw_mime.strip().lower())
+    if ext:
+        return ext
+    link = _read_str(media, "link", "url")
+    if link:
+        suffix = Path(urlsplit(link).path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            return ".jpg" if suffix == ".jpeg" else suffix
+    return default
+
+
+def _cache_image_bytes(data: bytes, ext: str) -> str:
+    if _hermes_cache_image_from_bytes is not None:
+        return _hermes_cache_image_from_bytes(data, ext=ext)
+    cache_dir = Path(os.path.expanduser("~/.hermes/cache/images"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"img_{uuid.uuid4().hex[:12]}{ext}"
+    path.write_bytes(data)
+    return str(path)
 
 
 def _extract_kapso_events(payload: Any, *, batch_header: Optional[str] = None) -> List[Dict[str, Any]]:
