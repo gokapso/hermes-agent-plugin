@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -616,9 +617,7 @@ def interactive_setup() -> None:
         try:
             if secret:
                 try:
-                    from hermes_cli.secret_prompt import masked_secret_prompt
-
-                    value = masked_secret_prompt(f"{label}{suffix}: ")
+                    value = _masked_secret_prompt(f"{label}{suffix}: ")
                 except Exception:
                     value = input(f"{label}{suffix}: ").strip()
             else:
@@ -744,9 +743,7 @@ def _save_or_prompt_env(
     try:
         if secret:
             try:
-                from hermes_cli.secret_prompt import masked_secret_prompt
-
-                value = masked_secret_prompt(f"{label}{suffix}: ").strip()
+                value = _masked_secret_prompt(f"{label}{suffix}: ").strip()
             except Exception:
                 value = input(f"{label}{suffix}: ").strip()
         else:
@@ -860,6 +857,17 @@ def _save_env_value(name: str, value: str) -> None:
         save_env_value(name, value)
     except Exception:
         os.environ[name] = value
+
+
+def _masked_secret_prompt(prompt: str) -> str:
+    from hermes_cli.secret_prompt import masked_secret_prompt
+
+    value = masked_secret_prompt(prompt)
+    # Hermes' raw-mode prompt writes LF while the terminal is still raw, which
+    # can move down without returning to column 0 on some terminals.
+    sys.stdout.write("\r")
+    sys.stdout.flush()
+    return value
 
 
 def _run_command(argv: List[str]) -> int:

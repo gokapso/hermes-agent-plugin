@@ -18,6 +18,11 @@ For private-repo installs, use the SSH URL instead:
 hermes plugins install git@github.com:gokapso/hermes-agent-plugin.git --enable
 ```
 
+If HTTPS asks for a GitHub username/password, the repo is private or your server
+cannot read it anonymously. GitHub no longer accepts account passwords for Git.
+Either make the repo public, or add an SSH key to GitHub and use the SSH command
+above.
+
 Hermes clones Git plugins into `~/.hermes/plugins/kapso` and loads them on the
 next session or gateway restart.
 
