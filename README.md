@@ -52,6 +52,7 @@ KAPSO_API_KEY=...
 KAPSO_WEBHOOK_SECRET=...
 KAPSO_PHONE_NUMBER_ID=...      # recommended for outbound and cron delivery
 KAPSO_HOME_CHANNEL=15551234567 # optional default recipient for deliver=kapso
+KAPSO_ALLOWED_USERS=15551234567 # recommended for production allowlisting
 ```
 
 Useful follow-up checks:
@@ -60,6 +61,20 @@ Useful follow-up checks:
 hermes kapso status
 kapso status
 kapso whatsapp numbers list --output json
+```
+
+To allow a specific WhatsApp user after setup:
+
+```bash
+hermes kapso setup --allowed-users 15551234567 --no-prompt
+hermes gateway restart
+```
+
+For development-only open access:
+
+```bash
+hermes kapso setup --allow-all-users --no-prompt
+hermes gateway restart
 ```
 
 The adapter listens on `0.0.0.0:8648` and accepts `POST /kapso/webhook` by

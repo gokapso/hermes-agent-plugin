@@ -657,6 +657,10 @@ def _setup_kapso_cli_command(parser) -> None:
         help="Save KAPSO_HOME_CHANNEL non-interactively.",
     )
     parser.add_argument(
+        "--allowed-users",
+        help="Comma-separated WhatsApp wa_id values allowed to use the bot.",
+    )
+    parser.add_argument(
         "--allow-all-users",
         action="store_true",
         help="Set KAPSO_ALLOW_ALL_USERS=true for development.",
@@ -715,6 +719,15 @@ def _run_kapso_setup_command(args) -> None:
         value=getattr(args, "home_channel", None),
         no_prompt=bool(getattr(args, "no_prompt", False)),
     )
+    allowed_users = getattr(args, "allowed_users", None)
+    if allowed_users:
+        cleaned = ",".join(
+            part.strip() for part in allowed_users.split(",") if part.strip()
+        )
+        if cleaned:
+            _save_env_value("KAPSO_ALLOWED_USERS", cleaned)
+            _save_env_value("KAPSO_ALLOW_ALL_USERS", "false")
+            print("Saved KAPSO_ALLOWED_USERS")
     if getattr(args, "allow_all_users", False):
         _save_env_value("KAPSO_ALLOW_ALL_USERS", "true")
         print("Saved KAPSO_ALLOW_ALL_USERS=true")
@@ -786,6 +799,7 @@ def _print_kapso_status() -> None:
         "KAPSO_WEBHOOK_SECRET",
         "KAPSO_PHONE_NUMBER_ID",
         "KAPSO_HOME_CHANNEL",
+        "KAPSO_ALLOWED_USERS",
         "KAPSO_ALLOW_ALL_USERS",
     ):
         value = _get_env_value(name)
@@ -810,6 +824,12 @@ Kapso Hermes setup
 
 2. Configure credentials and optionally install the Kapso CLI:
    hermes kapso setup --install-cli
+
+   For production, allow only your WhatsApp wa_id:
+   hermes kapso setup --allowed-users 15551234567 --no-prompt
+
+   For local testing only:
+   hermes kapso setup --allow-all-users --no-prompt
 
 3. Configure Kapso webhook:
    endpoint: https://<your-public-host>/kapso/webhook

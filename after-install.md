@@ -15,6 +15,12 @@ hermes kapso setup --install-cli
 It saves env vars to `~/.hermes/.env`, can install the Kapso CLI
 (`@kapso/cli`), and prints the webhook settings below.
 
+Allow at least one WhatsApp user before expecting inbound messages:
+
+```bash
+hermes kapso setup --allowed-users 15551234567 --no-prompt
+```
+
 Configure your Kapso webhook:
 
 | Setting | Value |
