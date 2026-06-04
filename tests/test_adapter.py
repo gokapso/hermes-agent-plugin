@@ -295,6 +295,55 @@ async def test_hydrates_image_media_into_hermes_cache(monkeypatch) -> None:
     assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
 
 
+async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_cache_audio_bytes", lambda data, ext: f"/tmp/hermes-audio{ext}")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                text=(
+                    '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=voice",'
+                    '"mime_type":"audio/ogg"}'
+                )
+            ),
+            FakeGetResponse(
+                body=b"OggSvoice-payload",
+                headers={"Content-Type": "audio/ogg; codecs=opus"},
+            ),
+        ]
+    )
+    payload = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.voice",
+            "from": "15551234567",
+            "type": "audio",
+            "audio": {"id": "media-voice", "mime_type": "audio/ogg", "voice": True},
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.message_type.value == "voice"
+    assert message_event.media_urls == ["/tmp/hermes-audio.ogg"]
+    assert message_event.media_types == ["audio/ogg"]
+    assert kapso._session.calls[0] == (
+        "https://api.kapso.ai/meta/whatsapp/v24.0/media-voice?phone_number_id=pn-123",
+        {"headers": {"X-API-Key": "key"}},
+    )
+    assert kapso._session.calls[1][0] == "https://api.kapso.ai/meta/whatsapp/media_download?token=voice"
+    assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
+
+
 def test_resolve_chat_id_accepts_encoded_and_plain_forms() -> None:
     kapso = adapter.KapsoAdapter(
         make_config(

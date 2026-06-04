@@ -53,6 +53,11 @@ try:
 except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
     _hermes_cache_image_from_bytes = None
 
+try:
+    from gateway.platforms.base import cache_audio_from_bytes as _hermes_cache_audio_from_bytes
+except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
+    _hermes_cache_audio_from_bytes = None
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.kapso.ai/meta/whatsapp"
@@ -77,6 +82,18 @@ _IMAGE_MIME_EXTENSIONS = {
     "image/png": ".png",
     "image/webp": ".webp",
     "image/gif": ".gif",
+}
+_AUDIO_MIME_EXTENSIONS = {
+    "audio/aac": ".aac",
+    "audio/amr": ".amr",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-m4a": ".m4a",
 }
 
 
@@ -415,8 +432,8 @@ class KapsoAdapter(BasePlatformAdapter):
         )
 
     async def _hydrate_media_event(self, event: MessageEvent, kapso_event: Dict[str, Any]) -> None:
-        """Download inbound image media into Hermes' local cache for vision."""
-        if event.message_type != MessageType.PHOTO:
+        """Download inbound media into Hermes' local caches for vision/STT."""
+        if event.message_type not in {MessageType.PHOTO, MessageType.AUDIO, MessageType.VOICE}:
             return
         if getattr(event, "media_urls", None):
             return
@@ -429,26 +446,29 @@ class KapsoAdapter(BasePlatformAdapter):
         if not message:
             return
 
-        media = _record(message.get("image"))
+        kind = "image" if event.message_type == MessageType.PHOTO else "audio"
+        media = _record(message.get(kind))
         if not media:
             return
 
-        media_url, mime_type = await self._resolve_media_download(kapso_event, message, media, "image")
+        media_url, mime_type = await self._resolve_media_download(kapso_event, message, media, kind)
         if not media_url:
             logger.info(
-                "[kapso] image message %s has no downloadable media URL yet",
+                "[kapso] %s message %s has no downloadable media URL yet",
+                kind,
                 event.message_id,
             )
             return
 
-        ext = _media_extension(media, mime_type)
+        ext = _media_extension(kind, media, mime_type, default=".ogg" if kind == "audio" else ".jpg")
         try:
             headers = _kapso_download_headers(media_url, self.api_key)
             async with self._session.get(media_url, headers=headers) as response:
                 if response.status >= 400:
                     text = await response.text()
                     logger.warning(
-                        "[kapso] failed to download image media %s: HTTP %s %s",
+                        "[kapso] failed to download %s media %s: HTTP %s %s",
+                        kind,
                         event.message_id,
                         response.status,
                         _compact(text),
@@ -457,21 +477,26 @@ class KapsoAdapter(BasePlatformAdapter):
                 data = await response.read()
                 content_type = response.headers.get("Content-Type", "")
         except Exception as exc:
-            logger.warning("[kapso] failed to download image media %s: %s", event.message_id, exc)
+            logger.warning("[kapso] failed to download %s media %s: %s", kind, event.message_id, exc)
             return
 
         if content_type:
-            ext = _media_extension({"mime_type": content_type}, content_type, default=ext)
+            ext = _media_extension(kind, {"mime_type": content_type}, content_type, default=ext)
             mime_type = content_type.split(";", 1)[0].strip() or mime_type
         try:
-            cached_path = _cache_image_bytes(data, ext)
+            if kind == "image":
+                cached_path = _cache_image_bytes(data, ext)
+                default_mime = f"image/{ext.lstrip('.')}"
+            else:
+                cached_path = _cache_audio_bytes(data, ext)
+                default_mime = f"audio/{ext.lstrip('.')}"
         except Exception as exc:
-            logger.warning("[kapso] failed to cache image media %s: %s", event.message_id, exc)
+            logger.warning("[kapso] failed to cache %s media %s: %s", kind, event.message_id, exc)
             return
 
         event.media_urls = [cached_path]
-        event.media_types = [mime_type or f"image/{ext.lstrip('.')}"]
-        logger.info("[kapso] cached inbound image %s at %s", event.message_id, cached_path)
+        event.media_types = [mime_type or default_mime]
+        logger.info("[kapso] cached inbound %s %s at %s", kind, event.message_id, cached_path)
 
     async def _resolve_media_download(
         self,
@@ -1230,20 +1255,25 @@ def _kapso_download_headers(url: str, api_key: str) -> Dict[str, str]:
 
 
 def _media_extension(
+    kind: str,
     media: Dict[str, Any],
     mime_type: Optional[str],
     *,
     default: str = ".jpg",
 ) -> str:
     raw_mime = (mime_type or _read_str(media, "mime_type", "mimeType") or "").split(";", 1)[0]
-    ext = _IMAGE_MIME_EXTENSIONS.get(raw_mime.strip().lower())
+    mime_map = _AUDIO_MIME_EXTENSIONS if kind == "audio" else _IMAGE_MIME_EXTENSIONS
+    ext = mime_map.get(raw_mime.strip().lower())
     if ext:
         return ext
     link = _read_str(media, "link", "url")
     if link:
         suffix = Path(urlsplit(link).path).suffix.lower()
-        if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-            return ".jpg" if suffix == ".jpeg" else suffix
+        allowed = set(mime_map.values())
+        if kind == "image" and suffix == ".jpeg":
+            return ".jpg"
+        if suffix in allowed:
+            return suffix
     return default
 
 
@@ -1253,6 +1283,16 @@ def _cache_image_bytes(data: bytes, ext: str) -> str:
     cache_dir = Path(os.path.expanduser("~/.hermes/cache/images"))
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / f"img_{uuid.uuid4().hex[:12]}{ext}"
+    path.write_bytes(data)
+    return str(path)
+
+
+def _cache_audio_bytes(data: bytes, ext: str) -> str:
+    if _hermes_cache_audio_from_bytes is not None:
+        return _hermes_cache_audio_from_bytes(data, ext=ext)
+    cache_dir = Path(os.path.expanduser("~/.hermes/cache/audio"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"audio_{uuid.uuid4().hex[:12]}{ext}"
     path.write_bytes(data)
     return str(path)
 
@@ -1313,10 +1353,14 @@ def _message_text(message: Dict[str, Any]) -> str:
 
 def _message_type(message: Dict[str, Any]) -> MessageType:
     msg_type = (_read_str(message, "type") or "text").lower()
+    if msg_type == "audio":
+        audio = _record(message.get("audio")) or {}
+        if _coerce_bool(_first_defined(audio.get("voice"), audio.get("is_voice")), default=False):
+            return MessageType.VOICE
+        return MessageType.AUDIO
     return {
         "image": MessageType.PHOTO,
         "video": MessageType.VIDEO,
-        "audio": MessageType.AUDIO,
         "voice": MessageType.VOICE,
         "document": MessageType.DOCUMENT,
         "sticker": MessageType.STICKER,

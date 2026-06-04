@@ -198,6 +198,25 @@ under `~/.hermes/cache/images`. If you only see `image message ... has no
 downloadable media URL yet`, confirm the webhook payload includes either
 `kapso.mediaUrl`/`kapso.media_url` or an image media `id`.
 
+If voice notes do not transcribe, first confirm the plugin cached the audio:
+
+```bash
+grep -R "cached inbound audio\|User sent audio\|STT" ~/.hermes/logs/*.log
+find ~/.hermes/cache/audio ~/.hermes/audio_cache -type f -mmin -10 -ls 2>/dev/null
+```
+
+Successful voice-note ingestion logs `cached inbound audio ...`. Hermes then
+uses its configured STT provider to transcribe the cached file. For a no-key
+local STT provider:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pip install -U faster-whisper
+hermes gateway restart
+```
+
+For OpenAI Whisper/transcribe instead, add `VOICE_TOOLS_OPENAI_KEY` to
+`~/.hermes/.env` and restart the gateway.
+
 ## Implementation Notes
 
 - `hermes plugins install ... --enable` prompts for `KAPSO_API_KEY` and
@@ -212,4 +231,6 @@ downloadable media URL yet`, confirm the webhook payload includes either
   converted to WhatsApp's `*bold*` style.
 - Inbound images are downloaded through Kapso, cached locally, and attached to
   Hermes `MessageEvent.media_urls` for native vision processing.
-- Non-image media currently lands as captions or descriptive placeholders.
+- Inbound audio and voice notes are downloaded through Kapso, cached locally,
+  and attached to Hermes `MessageEvent.media_urls` for native STT processing.
+- Other non-image media currently lands as captions or descriptive placeholders.
