@@ -30,13 +30,31 @@ pip install aiohttp
 
 ## Configure
 
-Set these in `~/.hermes/.env`:
+The easiest path is the plugin setup command:
+
+```bash
+hermes kapso setup --install-cli
+```
+
+That command saves values to `~/.hermes/.env`, optionally installs the Kapso CLI
+with `npm install -g @kapso/cli`, and prints the webhook settings to paste into
+Kapso.
+
+If you prefer to set env vars manually:
 
 ```bash
 KAPSO_API_KEY=...
 KAPSO_WEBHOOK_SECRET=...
 KAPSO_PHONE_NUMBER_ID=...      # recommended for outbound and cron delivery
 KAPSO_HOME_CHANNEL=15551234567 # optional default recipient for deliver=kapso
+```
+
+Useful follow-up checks:
+
+```bash
+hermes kapso status
+kapso status
+kapso whatsapp numbers list --output json
 ```
 
 The adapter listens on `0.0.0.0:8648` and accepts `POST /kapso/webhook` by
@@ -94,6 +112,13 @@ gateway:
 
 ## Notes
 
+- `hermes plugins install ... --enable` prompts for `KAPSO_API_KEY` and
+  `KAPSO_WEBHOOK_SECRET` automatically when they are missing.
+- `hermes kapso setup --install-cli` is safe to rerun when you need to rotate
+  keys or add `KAPSO_PHONE_NUMBER_ID`.
+- Hermes can run the Kapso CLI after installation, so you can ask the agent to
+  inspect numbers or webhook state. Enter secrets through the installer/setup
+  prompts rather than pasting them into chat.
 - Text messages are split at WhatsApp's 4096-character limit.
 - Outbound Markdown links are converted to `label (url)`, and `**bold**` is
   converted to WhatsApp's `*bold*` style.

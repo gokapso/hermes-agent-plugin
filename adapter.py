@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -634,6 +636,240 @@ def interactive_setup() -> None:
     print("Done. Restart the Hermes gateway after enabling the kapso plugin.")
 
 
+def _setup_kapso_cli_command(parser) -> None:
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("guide", "setup", "status", "install-cli"),
+        default="guide",
+        help="What to do. Defaults to guide.",
+    )
+    parser.add_argument("--api-key", help="Save KAPSO_API_KEY non-interactively.")
+    parser.add_argument(
+        "--webhook-secret",
+        help="Save KAPSO_WEBHOOK_SECRET non-interactively.",
+    )
+    parser.add_argument(
+        "--phone-number-id",
+        help="Save KAPSO_PHONE_NUMBER_ID non-interactively.",
+    )
+    parser.add_argument(
+        "--home-channel",
+        help="Save KAPSO_HOME_CHANNEL non-interactively.",
+    )
+    parser.add_argument(
+        "--allow-all-users",
+        action="store_true",
+        help="Set KAPSO_ALLOW_ALL_USERS=true for development.",
+    )
+    parser.add_argument(
+        "--install-cli",
+        action="store_true",
+        help="Also install the Kapso CLI with npm install -g @kapso/cli.",
+    )
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not prompt for missing values; only save supplied flags.",
+    )
+    parser.set_defaults(func=_kapso_cli_command)
+
+
+def _kapso_cli_command(args) -> None:
+    action = getattr(args, "action", "guide")
+    if action == "install-cli":
+        _install_kapso_cli()
+        return
+    if action == "status":
+        _print_kapso_status()
+        return
+    if action == "setup":
+        _run_kapso_setup_command(args)
+        return
+    _print_kapso_guide()
+
+
+def _run_kapso_setup_command(args) -> None:
+    _save_or_prompt_env(
+        "KAPSO_API_KEY",
+        "Kapso API key",
+        value=getattr(args, "api_key", None),
+        secret=True,
+        no_prompt=bool(getattr(args, "no_prompt", False)),
+    )
+    _save_or_prompt_env(
+        "KAPSO_WEBHOOK_SECRET",
+        "Kapso webhook secret",
+        value=getattr(args, "webhook_secret", None),
+        secret=True,
+        no_prompt=bool(getattr(args, "no_prompt", False)),
+    )
+    _save_or_prompt_env(
+        "KAPSO_PHONE_NUMBER_ID",
+        "Default WhatsApp phone_number_id",
+        value=getattr(args, "phone_number_id", None),
+        no_prompt=bool(getattr(args, "no_prompt", False)),
+    )
+    _save_or_prompt_env(
+        "KAPSO_HOME_CHANNEL",
+        "Default WhatsApp recipient for cron delivery",
+        value=getattr(args, "home_channel", None),
+        no_prompt=bool(getattr(args, "no_prompt", False)),
+    )
+    if getattr(args, "allow_all_users", False):
+        _save_env_value("KAPSO_ALLOW_ALL_USERS", "true")
+        print("Saved KAPSO_ALLOW_ALL_USERS=true")
+    if getattr(args, "install_cli", False):
+        _install_kapso_cli()
+    _print_kapso_status()
+    _print_webhook_instructions()
+
+
+def _save_or_prompt_env(
+    name: str,
+    label: str,
+    *,
+    value: Optional[str] = None,
+    secret: bool = False,
+    no_prompt: bool = False,
+) -> None:
+    current = _get_env_value(name)
+    if value:
+        _save_env_value(name, value)
+        print(f"Saved {name}")
+        return
+    if no_prompt:
+        return
+    suffix = " [keep current]" if current else ""
+    try:
+        if secret:
+            try:
+                from hermes_cli.secret_prompt import masked_secret_prompt
+
+                value = masked_secret_prompt(f"{label}{suffix}: ").strip()
+            except Exception:
+                value = input(f"{label}{suffix}: ").strip()
+        else:
+            value = input(f"{label}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if value:
+        _save_env_value(name, value)
+        print(f"Saved {name}")
+
+
+def _install_kapso_cli() -> bool:
+    if shutil.which("kapso"):
+        print("Kapso CLI is already installed:")
+        _run_command(["kapso", "--version"])
+        return True
+    npm = shutil.which("npm")
+    if not npm:
+        print("npm was not found. Install Node.js/npm, then run:")
+        print("  npm install -g @kapso/cli")
+        return False
+    print("Installing Kapso CLI with npm install -g @kapso/cli ...")
+    result = subprocess.run([npm, "install", "-g", "@kapso/cli"], check=False)
+    if result.returncode != 0:
+        print("Kapso CLI install failed. You can retry manually:")
+        print("  npm install -g @kapso/cli")
+        return False
+    print("Kapso CLI installed.")
+    _run_command(["kapso", "--version"])
+    return True
+
+
+def _print_kapso_status() -> None:
+    print()
+    print("Kapso Hermes plugin status")
+    print("--------------------------")
+    for name in (
+        "KAPSO_API_KEY",
+        "KAPSO_WEBHOOK_SECRET",
+        "KAPSO_PHONE_NUMBER_ID",
+        "KAPSO_HOME_CHANNEL",
+        "KAPSO_ALLOW_ALL_USERS",
+    ):
+        value = _get_env_value(name)
+        if name in {"KAPSO_API_KEY", "KAPSO_WEBHOOK_SECRET"}:
+            display = "set" if value else "missing"
+        else:
+            display = value or "missing"
+        print(f"{name}: {display}")
+    if shutil.which("kapso"):
+        print("Kapso CLI: installed")
+    else:
+        print("Kapso CLI: missing (run `hermes kapso install-cli`)")
+
+
+def _print_kapso_guide() -> None:
+    print(
+        """
+Kapso Hermes setup
+------------------
+1. Install and enable the plugin:
+   hermes plugins install gokapso/hermes-agent-plugin --enable
+
+2. Configure credentials and optionally install the Kapso CLI:
+   hermes kapso setup --install-cli
+
+3. Configure Kapso webhook:
+   endpoint: https://<your-public-host>/kapso/webhook
+   events: whatsapp.message.received
+   payload version: v2
+   secret: same value as KAPSO_WEBHOOK_SECRET
+
+4. Restart Hermes gateway:
+   hermes gateway restart
+
+Helpful checks:
+   hermes kapso status
+   kapso status
+   kapso whatsapp numbers list --output json
+""".strip()
+    )
+
+
+def _print_webhook_instructions() -> None:
+    print()
+    print("Webhook settings")
+    print("----------------")
+    print("Endpoint URL: https://<your-public-host>/kapso/webhook")
+    print("Events: whatsapp.message.received")
+    print("Payload version: v2")
+    print("Secret: same value as KAPSO_WEBHOOK_SECRET")
+    print()
+    print("Restart Hermes gateway after changing env vars:")
+    print("  hermes gateway restart")
+
+
+def _get_env_value(name: str) -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        return str(get_env_value(name) or "")
+    except Exception:
+        return os.getenv(name, "")
+
+
+def _save_env_value(name: str, value: str) -> None:
+    try:
+        from hermes_cli.config import save_env_value
+
+        save_env_value(name, value)
+    except Exception:
+        os.environ[name] = value
+
+
+def _run_command(argv: List[str]) -> int:
+    try:
+        result = subprocess.run(argv, check=False)
+        return int(result.returncode)
+    except FileNotFoundError:
+        return 127
+
+
 def register(ctx) -> None:
     """Plugin entry point called by Hermes."""
     ctx.register_platform(
@@ -664,6 +900,15 @@ def register(ctx) -> None:
             "Outside WhatsApp's active conversation window, proactive messages may "
             "require approved templates."
         ),
+    )
+    ctx.register_cli_command(
+        name="kapso",
+        help="Configure the Kapso WhatsApp Hermes plugin",
+        description=(
+            "Configure Kapso credentials, install/check the Kapso CLI, and "
+            "print webhook settings for the Hermes platform adapter."
+        ),
+        setup_fn=_setup_kapso_cli_command,
     )
 
 

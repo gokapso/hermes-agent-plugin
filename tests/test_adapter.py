@@ -281,9 +281,13 @@ async def test_send_posts_text_to_kapso_proxy() -> None:
 def test_register_supplies_platform_hooks() -> None:
     class Ctx:
         kwargs = None
+        cli_kwargs = None
 
         def register_platform(self, **kwargs):
             self.kwargs = kwargs
+
+        def register_cli_command(self, **kwargs):
+            self.cli_kwargs = kwargs
 
     ctx = Ctx()
     adapter.register(ctx)
@@ -293,3 +297,5 @@ def test_register_supplies_platform_hooks() -> None:
     assert callable(ctx.kwargs["standalone_sender_fn"])
     assert ctx.kwargs["cron_deliver_env_var"] == "KAPSO_HOME_CHANNEL"
     assert ctx.kwargs["max_message_length"] == adapter.MAX_WHATSAPP_TEXT_LENGTH
+    assert ctx.cli_kwargs["name"] == "kapso"
+    assert callable(ctx.cli_kwargs["setup_fn"])

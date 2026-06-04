@@ -6,12 +6,14 @@ Enable the plugin if you did not pass `--enable`:
 hermes plugins enable kapso
 ```
 
-Set the optional outbound defaults in `~/.hermes/.env`:
+Run the guided setup command:
 
 ```bash
-KAPSO_PHONE_NUMBER_ID=...
-KAPSO_HOME_CHANNEL=15551234567
+hermes kapso setup --install-cli
 ```
+
+It saves env vars to `~/.hermes/.env`, can install the Kapso CLI
+(`@kapso/cli`), and prints the webhook settings below.
 
 Configure your Kapso webhook:
 
@@ -26,4 +28,12 @@ Restart the gateway after enabling or changing env vars:
 
 ```bash
 hermes gateway restart
+```
+
+Useful checks:
+
+```bash
+hermes kapso status
+kapso status
+kapso whatsapp numbers list --output json
 ```
