@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -770,8 +771,8 @@ def interactive_setup() -> None:
     print()
     print("Kapso WhatsApp setup")
     print("--------------------")
-    print("Create a Kapso API key, connect a WhatsApp phone number, and configure")
-    print(f"your Kapso webhook URL as http(s)://<host>{DEFAULT_WEBHOOK_PATH}.")
+    print("Paste your Kapso API key first. Then run `hermes kapso setup --install-cli`")
+    print("to choose a WhatsApp number and configure the webhook from the terminal.")
     print()
 
     try:
@@ -798,10 +799,7 @@ def interactive_setup() -> None:
             set_env_var(var, value)
 
     prompt("KAPSO_API_KEY", "Kapso API key", secret=True)
-    prompt("KAPSO_PHONE_NUMBER_ID", "Kapso WhatsApp phone_number_id")
-    prompt("KAPSO_WEBHOOK_SECRET", "Kapso webhook secret", secret=True)
-    prompt("KAPSO_HOME_CHANNEL", "Default WhatsApp recipient for cron delivery (optional)")
-    print("Done. Restart the Hermes gateway after enabling the kapso plugin.")
+    print("Done. Continue with: hermes kapso setup --install-cli")
 
 
 def _setup_kapso_cli_command(parser) -> None:
@@ -816,6 +814,19 @@ def _setup_kapso_cli_command(parser) -> None:
     parser.add_argument(
         "--webhook-secret",
         help="Save KAPSO_WEBHOOK_SECRET non-interactively.",
+    )
+    parser.add_argument(
+        "--funnel-url",
+        help="Public Tailscale Funnel/base URL. /kapso/webhook is appended automatically.",
+    )
+    parser.add_argument(
+        "--webhook-url",
+        help="Full public Kapso webhook endpoint URL.",
+    )
+    parser.add_argument(
+        "--configure-webhook",
+        action="store_true",
+        help="Use the Kapso CLI to create the WhatsApp webhook after setup.",
     )
     parser.add_argument(
         "--phone-number-id",
@@ -862,32 +873,36 @@ def _kapso_cli_command(args) -> None:
 
 
 def _run_kapso_setup_command(args) -> None:
+    no_prompt = bool(getattr(args, "no_prompt", False))
     _save_or_prompt_env(
         "KAPSO_API_KEY",
         "Kapso API key",
         value=getattr(args, "api_key", None),
         secret=True,
-        no_prompt=bool(getattr(args, "no_prompt", False)),
+        no_prompt=no_prompt,
     )
-    _save_or_prompt_env(
-        "KAPSO_WEBHOOK_SECRET",
-        "Kapso webhook secret",
-        value=getattr(args, "webhook_secret", None),
-        secret=True,
-        no_prompt=bool(getattr(args, "no_prompt", False)),
-    )
-    _save_or_prompt_env(
-        "KAPSO_PHONE_NUMBER_ID",
-        "Default WhatsApp phone_number_id",
-        value=getattr(args, "phone_number_id", None),
-        no_prompt=bool(getattr(args, "no_prompt", False)),
-    )
-    _save_or_prompt_env(
-        "KAPSO_HOME_CHANNEL",
-        "Default WhatsApp recipient for cron delivery",
-        value=getattr(args, "home_channel", None),
-        no_prompt=bool(getattr(args, "no_prompt", False)),
-    )
+    if getattr(args, "install_cli", False):
+        _install_kapso_cli()
+
+    use_cli_setup = bool(getattr(args, "configure_webhook", False))
+    if not no_prompt and _get_env_value("KAPSO_API_KEY"):
+        if not shutil.which("kapso") and _yes_no_prompt(
+            "Install the Kapso CLI now?",
+            default=bool(getattr(args, "install_cli", False)),
+        ):
+            _install_kapso_cli()
+        if shutil.which("kapso"):
+            use_cli_setup = _yes_no_prompt(
+                "Use the Kapso CLI to choose a WhatsApp number and create the webhook?",
+                default=True,
+            )
+
+    if use_cli_setup:
+        if not _run_kapso_cli_setup_flow(args):
+            _run_manual_kapso_setup_prompts(args, no_prompt=no_prompt)
+    else:
+        _run_manual_kapso_setup_prompts(args, no_prompt=no_prompt)
+
     allowed_users = getattr(args, "allowed_users", None)
     if allowed_users:
         cleaned = ",".join(
@@ -900,10 +915,30 @@ def _run_kapso_setup_command(args) -> None:
     if getattr(args, "allow_all_users", False):
         _save_env_value("KAPSO_ALLOW_ALL_USERS", "true")
         print("Saved KAPSO_ALLOW_ALL_USERS=true")
-    if getattr(args, "install_cli", False):
-        _install_kapso_cli()
     _print_kapso_status()
     _print_webhook_instructions()
+
+
+def _run_manual_kapso_setup_prompts(args, *, no_prompt: bool) -> None:
+    _save_or_prompt_env(
+        "KAPSO_WEBHOOK_SECRET",
+        "Kapso webhook secret",
+        value=getattr(args, "webhook_secret", None),
+        secret=True,
+        no_prompt=no_prompt,
+    )
+    _save_or_prompt_env(
+        "KAPSO_PHONE_NUMBER_ID",
+        "Default WhatsApp phone_number_id",
+        value=getattr(args, "phone_number_id", None),
+        no_prompt=no_prompt,
+    )
+    _save_or_prompt_env(
+        "KAPSO_HOME_CHANNEL",
+        "Default WhatsApp recipient for cron delivery",
+        value=getattr(args, "home_channel", None),
+        no_prompt=no_prompt,
+    )
 
 
 def _save_or_prompt_env(
@@ -959,6 +994,226 @@ def _install_kapso_cli() -> bool:
     return True
 
 
+def _run_kapso_cli_setup_flow(args) -> bool:
+    if not shutil.which("kapso"):
+        print("Kapso CLI is not installed. Run: hermes kapso setup --install-cli")
+        return False
+
+    no_prompt = bool(getattr(args, "no_prompt", False))
+    phone_number_id = (getattr(args, "phone_number_id", None) or "").strip()
+    if not phone_number_id:
+        numbers = _load_kapso_phone_numbers()
+        phone_number_id = _select_kapso_phone_number(numbers, no_prompt=no_prompt)
+    if not phone_number_id:
+        print("Could not choose a WhatsApp phone_number_id from the Kapso CLI.")
+        return False
+    _save_env_value("KAPSO_PHONE_NUMBER_ID", phone_number_id)
+    print("Saved KAPSO_PHONE_NUMBER_ID")
+
+    home_channel = (getattr(args, "home_channel", None) or "").strip()
+    if not home_channel and not no_prompt:
+        current = _get_env_value("KAPSO_HOME_CHANNEL")
+        suffix = f" [{current}]" if current else ""
+        home_channel = input(
+            f"Your WhatsApp number/wa_id for testing and allowlist{suffix}: "
+        ).strip() or current
+    if home_channel:
+        normalized_home = _normalize_phone(home_channel) or home_channel
+        _save_env_value("KAPSO_HOME_CHANNEL", normalized_home)
+        print("Saved KAPSO_HOME_CHANNEL")
+        if not getattr(args, "allowed_users", None) and not _get_env_value("KAPSO_ALLOWED_USERS"):
+            _save_env_value("KAPSO_ALLOWED_USERS", normalized_home)
+            _save_env_value("KAPSO_ALLOW_ALL_USERS", "false")
+            print("Saved KAPSO_ALLOWED_USERS")
+
+    webhook_url = _resolve_setup_webhook_url(args, no_prompt=no_prompt)
+    if not webhook_url:
+        print("Skipped webhook creation because no public Funnel/webhook URL was provided.")
+        return True
+
+    webhook_secret = (getattr(args, "webhook_secret", None) or "").strip()
+    if not webhook_secret:
+        webhook_secret = _get_env_value("KAPSO_WEBHOOK_SECRET")
+    if not webhook_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+        print("Generated KAPSO_WEBHOOK_SECRET")
+    _save_env_value("KAPSO_WEBHOOK_SECRET", webhook_secret)
+    _save_env_value("KAPSO_WEBHOOK_URL", webhook_url)
+
+    if _create_kapso_webhook(phone_number_id, webhook_url, webhook_secret):
+        print("Kapso webhook created.")
+    else:
+        print("Kapso webhook creation failed. Use the printed settings below as a fallback.")
+    return True
+
+
+def _load_kapso_phone_numbers() -> List[Dict[str, Any]]:
+    result = _run_command_capture(["kapso", "whatsapp", "numbers", "list", "--output", "json"])
+    if result.returncode != 0:
+        print("Could not list Kapso WhatsApp numbers.")
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        print("Try `kapso login` or `kapso status`, then rerun `hermes kapso setup`.")
+        return []
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        print("Kapso CLI returned non-JSON phone number output.")
+        return []
+    return _extract_phone_numbers(payload)
+
+
+def _extract_phone_numbers(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = (
+            payload.get("data")
+            or payload.get("phone_numbers")
+            or payload.get("phoneNumbers")
+            or payload.get("items")
+            or []
+        )
+    else:
+        items = []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _select_kapso_phone_number(numbers: List[Dict[str, Any]], *, no_prompt: bool) -> str:
+    if not numbers:
+        return ""
+    if len(numbers) == 1:
+        phone_number_id = _phone_number_id(numbers[0])
+        if phone_number_id:
+            print(f"Using WhatsApp number: {_format_phone_number_option(numbers[0])}")
+        return phone_number_id
+    print()
+    print("Connected WhatsApp numbers")
+    print("--------------------------")
+    for index, number in enumerate(numbers, start=1):
+        print(f"{index}. {_format_phone_number_option(number)}")
+    if no_prompt:
+        return ""
+    while True:
+        choice = input("Choose a WhatsApp number: ").strip()
+        if not choice:
+            return ""
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Enter the number from the list.")
+            continue
+        if 1 <= index <= len(numbers):
+            return _phone_number_id(numbers[index - 1])
+        print("Choice out of range.")
+
+
+def _phone_number_id(number: Dict[str, Any]) -> str:
+    return _read_str(number, "phone_number_id", "phoneNumberId", "id", "meta_phone_number_id") or ""
+
+
+def _display_phone_number(number: Dict[str, Any]) -> str:
+    return (
+        _read_str(number, "display_phone_number", "displayPhoneNumber", "phone_number", "phoneNumber")
+        or _phone_number_id(number)
+    )
+
+
+def _format_phone_number_option(number: Dict[str, Any]) -> str:
+    phone_number_id = _phone_number_id(number)
+    label = _read_str(number, "name", "label", "customer_name", "customerName")
+    display = _display_phone_number(number)
+    bits = [display]
+    if label and label != display:
+        bits.append(label)
+    if phone_number_id and phone_number_id != display:
+        bits.append(f"id={phone_number_id}")
+    return " | ".join(bits)
+
+
+def _resolve_setup_webhook_url(args, *, no_prompt: bool) -> str:
+    webhook_url = (getattr(args, "webhook_url", None) or "").strip()
+    funnel_url = (getattr(args, "funnel_url", None) or "").strip()
+    if webhook_url:
+        return webhook_url.rstrip("/")
+    if not webhook_url and funnel_url:
+        webhook_url = _webhook_url_from_base(funnel_url)
+    if not webhook_url and not no_prompt:
+        current_hint = _webhook_url_from_base("https://<your-funnel-host>")
+        value = input(f"Public Funnel/webhook URL [{current_hint}]: ").strip()
+        if value:
+            webhook_url = _webhook_url_from_base(value)
+    return webhook_url.rstrip("/") if webhook_url else ""
+
+
+def _webhook_url_from_base(value: str) -> str:
+    url = str(value or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if url.endswith(DEFAULT_WEBHOOK_PATH):
+        return url
+    return f"{url}{DEFAULT_WEBHOOK_PATH}"
+
+
+def _create_kapso_webhook(phone_number_id: str, webhook_url: str, webhook_secret: str) -> bool:
+    argv = [
+        "kapso",
+        "whatsapp",
+        "webhooks",
+        "new",
+        "--phone-number-id",
+        phone_number_id,
+        "--url",
+        webhook_url,
+        "--event",
+        KAPSO_MESSAGE_RECEIVED_EVENT,
+        "--payload-version",
+        "v2",
+        "--kind",
+        "kapso",
+        "--secret-key",
+        webhook_secret,
+        "--active",
+        "--output",
+        "json",
+    ]
+    result = _run_command_capture(argv)
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        elif result.stdout.strip():
+            print(result.stdout.strip())
+        return False
+    try:
+        payload = json.loads(result.stdout or "{}")
+        webhook_id = _read_str(_record(payload.get("data")) or payload, "id")
+        if webhook_id:
+            print(f"Webhook ID: {webhook_id}")
+    except json.JSONDecodeError:
+        pass
+    return True
+
+
+def _yes_no_prompt(label: str, *, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    try:
+        value = input(f"{label} [{suffix}]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not value:
+        return default
+    return value in {"y", "yes", "1", "true"}
+
+
+def _run_command_capture(argv: List[str]) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    api_key = _get_env_value("KAPSO_API_KEY")
+    if api_key:
+        env["KAPSO_API_KEY"] = api_key
+    return subprocess.run(argv, check=False, capture_output=True, text=True, env=env)
+
+
 def _print_kapso_status() -> None:
     print()
     print("Kapso Hermes plugin status")
@@ -968,6 +1223,7 @@ def _print_kapso_status() -> None:
         "KAPSO_WEBHOOK_SECRET",
         "KAPSO_PHONE_NUMBER_ID",
         "KAPSO_HOME_CHANNEL",
+        "KAPSO_WEBHOOK_URL",
         "KAPSO_ALLOWED_USERS",
         "KAPSO_ALLOW_ALL_USERS",
     ):
@@ -994,13 +1250,18 @@ Kapso Hermes setup
 2. Configure credentials and optionally install the Kapso CLI:
    hermes kapso setup --install-cli
 
-   For production, allow only your WhatsApp wa_id:
-   hermes kapso setup --allowed-users 15551234567 --no-prompt
+   To let the setup command choose a connected number and create the webhook:
+   hermes kapso setup --install-cli --funnel-url https://<your-funnel-host>
+
+   Non-interactive production setup:
+   hermes kapso setup --phone-number-id <id> --home-channel 15551234567 \\
+     --allowed-users 15551234567 --funnel-url https://<host> \\
+     --configure-webhook --no-prompt
 
    For local testing only:
    hermes kapso setup --allow-all-users --no-prompt
 
-3. Configure Kapso webhook:
+3. Kapso webhook settings:
    endpoint: https://<your-public-host>/kapso/webhook
    events: whatsapp.message.received
    payload version: v2
@@ -1018,10 +1279,11 @@ Helpful checks:
 
 
 def _print_webhook_instructions() -> None:
+    endpoint = _get_env_value("KAPSO_WEBHOOK_URL") or "https://<your-public-host>/kapso/webhook"
     print()
     print("Webhook settings")
     print("----------------")
-    print("Endpoint URL: https://<your-public-host>/kapso/webhook")
+    print(f"Endpoint URL: {endpoint}")
     print("Events: whatsapp.message.received")
     print("Payload version: v2")
     print("Secret: same value as KAPSO_WEBHOOK_SECRET")
@@ -1076,7 +1338,7 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["KAPSO_API_KEY", "KAPSO_WEBHOOK_SECRET"],
+        required_env=["KAPSO_API_KEY"],
         install_hint="pip install aiohttp",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,

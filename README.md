@@ -6,35 +6,63 @@ Hermes replies through Kapso's WhatsApp Cloud API proxy.
 
 ## Install
 
+### Prerequisites
+
+- A Hermes Agent install with the gateway enabled.
+- A Kapso account. Sign up at [kapso.ai](https://kapso.ai/), create or open a
+  project, and create a project API key in the Kapso dashboard.
+- A connected Kapso WhatsApp number. If you do not have one yet, run
+  `kapso setup` after installing the Kapso CLI, or complete WhatsApp onboarding
+  in the Kapso dashboard.
+- A public HTTPS URL that can reach the Hermes Kapso adapter. Tailscale Funnel
+  works well and should proxy to `http://127.0.0.1:8648`.
+- Node.js/npm if you want the setup command to install and use the Kapso CLI.
+
 Install and enable the plugin from GitHub:
 
 ```bash
 hermes plugins install gokapso/hermes-agent-plugin --enable
 ```
 
+The installer prompts only for `KAPSO_API_KEY`. Webhook setup happens in the
+next step.
+
 Hermes clones Git plugins into `~/.hermes/plugins/kapso` and loads them on the
 next session or gateway restart.
 
 ## Quickstart
 
-Run the guided setup:
+Recommended setup:
 
 ```bash
-hermes kapso setup --install-cli
+hermes kapso setup --install-cli --funnel-url https://<your-funnel-host>
 ```
 
-This saves values to `~/.hermes/.env`, optionally installs the Kapso CLI with
-`npm install -g @kapso/cli`, and prints the webhook settings to paste into Kapso.
+That command can:
+
+- install the Kapso CLI with `npm install -g @kapso/cli`
+- list connected WhatsApp numbers from Kapso and ask which one Hermes should use
+- ask for your WhatsApp user number/wa_id for `KAPSO_HOME_CHANNEL` and
+  `KAPSO_ALLOWED_USERS`
+- generate and save `KAPSO_WEBHOOK_SECRET`
+- create the Kapso phone-number webhook with payload version `v2`
+
+The webhook created by the helper points at:
+
+```text
+https://<your-funnel-host>/kapso/webhook
+```
 
 For a non-interactive setup:
 
 ```bash
 hermes kapso setup \
   --api-key "$KAPSO_API_KEY" \
-  --webhook-secret "$KAPSO_WEBHOOK_SECRET" \
   --phone-number-id "1041695002363992" \
   --home-channel "15551234567" \
   --allowed-users "15551234567" \
+  --funnel-url "https://<your-funnel-host>" \
+  --configure-webhook \
   --install-cli \
   --no-prompt
 ```
@@ -78,6 +106,18 @@ curl http://127.0.0.1:8648/health
 curl https://<your-funnel-host>/health
 ```
 
+If CLI webhook creation fails, create the webhook manually in Kapso with these
+settings:
+
+| Setting | Value |
+| --- | --- |
+| Scope | WhatsApp phone number |
+| Endpoint URL | `https://<your-funnel-host>/kapso/webhook` |
+| Events | `whatsapp.message.received` |
+| Kind | `kapso` |
+| Payload version | `v2` |
+| Secret | Same value as `KAPSO_WEBHOOK_SECRET` |
+
 ## Configuration
 
 The setup command writes these values to `~/.hermes/.env`:
@@ -88,6 +128,7 @@ KAPSO_WEBHOOK_SECRET=...
 KAPSO_PHONE_NUMBER_ID=...      # recommended for outbound and cron delivery
 KAPSO_HOME_CHANNEL=15551234567 # optional default recipient for deliver=kapso
 KAPSO_ALLOWED_USERS=15551234567 # recommended for production allowlisting
+KAPSO_WEBHOOK_URL=https://...  # status/debug only
 ```
 
 To allow a specific WhatsApp user later:
@@ -115,6 +156,60 @@ Signature verification is on by default. For unsigned local fixtures only:
 
 ```bash
 KAPSO_VERIFY_WEBHOOK_SIGNATURES=false
+```
+
+## Voice Notes
+
+Inbound WhatsApp voice notes are downloaded through Kapso, cached as `.ogg`,
+and passed to Hermes as audio media. Hermes then transcribes them with its STT
+provider before the agent turn.
+
+For local, no-key transcription with `faster-whisper`:
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg python3-venv python3-pip
+
+~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade || true
+~/.hermes/hermes-agent/venv/bin/python -m pip install -U pip setuptools wheel
+~/.hermes/hermes-agent/venv/bin/python -m pip install -U faster-whisper
+
+hermes config set stt.provider local
+hermes config set stt.local.model base
+hermes gateway restart
+```
+
+If the Hermes venv has no `pip` and `ensurepip` is unavailable:
+
+```bash
+curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+~/.hermes/hermes-agent/venv/bin/python /tmp/get-pip.py
+~/.hermes/hermes-agent/venv/bin/python -m pip install -U faster-whisper
+```
+
+For OpenAI transcription:
+
+```bash
+printf '\nVOICE_TOOLS_OPENAI_KEY=sk-...\n' >> ~/.hermes/.env
+hermes config set stt.provider openai
+hermes config set stt.openai.model gpt-4o-mini-transcribe
+hermes gateway restart
+```
+
+Other OpenAI model options include `whisper-1` and `gpt-4o-transcribe`.
+
+Verify voice-note processing:
+
+```bash
+tail -f ~/.hermes/logs/gateway.log ~/.hermes/logs/agent.log \
+  | grep --line-buffered -iE 'kapso|audio|voice|stt|transcrib|whisper|openai'
+```
+
+Healthy STT logs look like:
+
+```text
+[kapso] cached inbound audio ... at ~/.hermes/audio_cache/audio_....ogg
+Transcribed audio_....ogg via local whisper (base, lang=en, ...)
 ```
 
 ## Chat IDs
@@ -194,8 +289,9 @@ journalctl --user -u hermes-gateway.service -f | grep -i kapso
 ```
 
 Successful image ingestion logs `cached inbound image ...` and writes the file
-under `~/.hermes/cache/images`. If you only see `image message ... has no
-downloadable media URL yet`, confirm the webhook payload includes either
+under `~/.hermes/image_cache` or `~/.hermes/cache/images`, depending on the
+Hermes runtime version. If you only see `image message ... has no downloadable
+media URL yet`, confirm the webhook payload includes either
 `kapso.mediaUrl`/`kapso.media_url` or an image media `id`.
 
 If voice notes do not transcribe, first confirm the plugin cached the audio:
@@ -205,9 +301,10 @@ grep -R "cached inbound audio\|User sent audio\|STT" ~/.hermes/logs/*.log
 find ~/.hermes/cache/audio ~/.hermes/audio_cache -type f -mmin -10 -ls 2>/dev/null
 ```
 
-Successful voice-note ingestion logs `cached inbound audio ...`. Hermes then
-uses its configured STT provider to transcribe the cached file. For a no-key
-local STT provider:
+Successful voice-note ingestion logs `cached inbound audio ...`. The cached
+file is usually under `~/.hermes/audio_cache` or `~/.hermes/cache/audio`.
+Hermes then uses its configured STT provider to transcribe the cached file. For
+a no-key local STT provider:
 
 ```bash
 ~/.hermes/hermes-agent/venv/bin/python -m pip install -U faster-whisper
@@ -221,8 +318,8 @@ OpenAI STT compatibility.
 
 ## Implementation Notes
 
-- `hermes plugins install ... --enable` prompts for `KAPSO_API_KEY` and
-  `KAPSO_WEBHOOK_SECRET` automatically when they are missing.
+- `hermes plugins install ... --enable` prompts only for `KAPSO_API_KEY`.
+  `hermes kapso setup` handles the webhook secret and phone number setup.
 - `hermes kapso setup --install-cli` is safe to rerun when you need to rotate
   keys or add `KAPSO_PHONE_NUMBER_ID`.
 - Hermes can run the Kapso CLI after installation, so you can ask the agent to

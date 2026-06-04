@@ -359,6 +359,44 @@ def test_resolve_chat_id_accepts_encoded_and_plain_forms() -> None:
     assert kapso._resolve_chat_id("+1 (555) 123-4567") == ("pn-default", "+15551234567")
 
 
+def test_extract_phone_numbers_from_cli_shapes() -> None:
+    payload = {
+        "data": [
+            {"phone_number_id": "pn-1", "display_phone_number": "+1 555"},
+            {"phoneNumberId": "pn-2", "phoneNumber": "+1 777"},
+        ]
+    }
+
+    numbers = adapter._extract_phone_numbers(payload)
+
+    assert [adapter._phone_number_id(number) for number in numbers] == ["pn-1", "pn-2"]
+    assert adapter._display_phone_number(numbers[0]) == "+1 555"
+    assert adapter._display_phone_number(numbers[1]) == "+1 777"
+
+
+def test_webhook_url_from_funnel_base() -> None:
+    assert (
+        adapter._webhook_url_from_base("https://example.ts.net")
+        == "https://example.ts.net/kapso/webhook"
+    )
+    assert (
+        adapter._webhook_url_from_base("https://example.ts.net/kapso/webhook")
+        == "https://example.ts.net/kapso/webhook"
+    )
+
+
+def test_resolve_setup_webhook_url_preserves_explicit_endpoint() -> None:
+    args = types.SimpleNamespace(
+        webhook_url="https://example.ts.net/custom/webhook/",
+        funnel_url="",
+    )
+
+    assert (
+        adapter._resolve_setup_webhook_url(args, no_prompt=True)
+        == "https://example.ts.net/custom/webhook"
+    )
+
+
 class FakeResponse:
     status = 200
 
@@ -420,6 +458,7 @@ def test_register_supplies_platform_hooks() -> None:
     adapter.register(ctx)
 
     assert ctx.kwargs["name"] == "kapso"
+    assert ctx.kwargs["required_env"] == ["KAPSO_API_KEY"]
     assert callable(ctx.kwargs["env_enablement_fn"])
     assert callable(ctx.kwargs["standalone_sender_fn"])
     assert ctx.kwargs["cron_deliver_env_var"] == "KAPSO_HOME_CHANNEL"

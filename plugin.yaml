@@ -1,7 +1,7 @@
 name: kapso
 label: Kapso WhatsApp
 kind: platform
-version: 0.1.6
+version: 0.2.0
 description: >
   Kapso WhatsApp gateway adapter for Hermes Agent. Receives Kapso platform
   webhooks and sends replies through Kapso's WhatsApp Cloud API proxy.
@@ -12,11 +12,11 @@ requires_env:
     prompt: "Kapso API key"
     url: "https://kapso.ai/"
     password: true
+optional_env:
   - name: KAPSO_WEBHOOK_SECRET
     description: "Secret used to verify Kapso X-Webhook-Signature webhook deliveries"
     prompt: "Kapso webhook secret"
     password: true
-optional_env:
   - name: KAPSO_PHONE_NUMBER_ID
     description: "Default Kapso WhatsApp phone_number_id for outbound messages and cron delivery"
     prompt: "Kapso phone_number_id"
@@ -44,6 +44,10 @@ optional_env:
   - name: KAPSO_WEBHOOK_PATH
     description: "Webhook path (default: /kapso/webhook)"
     prompt: "Webhook path"
+    password: false
+  - name: KAPSO_WEBHOOK_URL
+    description: "Public webhook endpoint created by the setup helper (status/debug only)"
+    prompt: "Kapso webhook URL"
     password: false
   - name: KAPSO_VERIFY_WEBHOOK_SIGNATURES
     description: "Set false only for local unsigned webhook fixtures"
