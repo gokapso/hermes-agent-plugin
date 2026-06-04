@@ -6,46 +6,81 @@ Hermes replies through Kapso's WhatsApp Cloud API proxy.
 
 ## Install
 
-Copy this directory into a Hermes platform plugin path:
+Install and enable the plugin from GitHub:
 
 ```bash
 hermes plugins install gokapso/hermes-agent-plugin --enable
 ```
 
-For private-repo installs, use the SSH URL instead:
-
-```bash
-hermes plugins install git@github.com:gokapso/hermes-agent-plugin.git --enable
-```
-
-If HTTPS asks for a GitHub username/password, the repo is private or your server
-cannot read it anonymously. GitHub no longer accepts account passwords for Git.
-Either make the repo public, or add an SSH key to GitHub and use the SSH command
-above.
-
 Hermes clones Git plugins into `~/.hermes/plugins/kapso` and loads them on the
 next session or gateway restart.
 
-Install the only runtime dependency if your Hermes environment does not already
-include it:
+## Quickstart
 
-```bash
-pip install aiohttp
-```
-
-## Configure
-
-The easiest path is the plugin setup command:
+Run the guided setup:
 
 ```bash
 hermes kapso setup --install-cli
 ```
 
-That command saves values to `~/.hermes/.env`, optionally installs the Kapso CLI
-with `npm install -g @kapso/cli`, and prints the webhook settings to paste into
-Kapso.
+This saves values to `~/.hermes/.env`, optionally installs the Kapso CLI with
+`npm install -g @kapso/cli`, and prints the webhook settings to paste into Kapso.
 
-If you prefer to set env vars manually:
+For a non-interactive setup:
+
+```bash
+hermes kapso setup \
+  --api-key "$KAPSO_API_KEY" \
+  --webhook-secret "$KAPSO_WEBHOOK_SECRET" \
+  --phone-number-id "1041695002363992" \
+  --home-channel "15551234567" \
+  --allowed-users "15551234567" \
+  --install-cli \
+  --no-prompt
+```
+
+Restart the gateway after setup:
+
+```bash
+hermes gateway restart
+hermes gateway status
+```
+
+Expose the adapter to Kapso. The adapter listens on `0.0.0.0:8648` and accepts
+`POST /kapso/webhook` by default. With Tailscale Funnel, point the public URL at
+that local port:
+
+```bash
+tailscale funnel reset
+tailscale funnel --bg http://127.0.0.1:8648
+tailscale funnel status
+```
+
+Set the Kapso webhook URL to:
+
+```text
+https://<your-funnel-host>/kapso/webhook
+```
+
+Recommended Kapso webhook settings:
+
+| Setting | Value |
+| --- | --- |
+| Events | `whatsapp.message.received` |
+| Payload version | `v2` |
+| Secret | Same value as `KAPSO_WEBHOOK_SECRET` |
+
+Verify the setup:
+
+```bash
+hermes kapso status
+curl http://127.0.0.1:8648/health
+curl https://<your-funnel-host>/health
+```
+
+## Configuration
+
+The setup command writes these values to `~/.hermes/.env`:
 
 ```bash
 KAPSO_API_KEY=...
@@ -55,15 +90,7 @@ KAPSO_HOME_CHANNEL=15551234567 # optional default recipient for deliver=kapso
 KAPSO_ALLOWED_USERS=15551234567 # recommended for production allowlisting
 ```
 
-Useful follow-up checks:
-
-```bash
-hermes kapso status
-kapso status
-kapso whatsapp numbers list --output json
-```
-
-To allow a specific WhatsApp user after setup:
+To allow a specific WhatsApp user later:
 
 ```bash
 hermes kapso setup --allowed-users 15551234567 --no-prompt
@@ -77,16 +104,12 @@ hermes kapso setup --allow-all-users --no-prompt
 hermes gateway restart
 ```
 
-The adapter listens on `0.0.0.0:8648` and accepts `POST /kapso/webhook` by
-default. Configure the Kapso webhook to point at your public URL for that path.
+Useful Kapso CLI checks after `--install-cli`:
 
-Recommended Kapso webhook settings:
-
-| Setting | Value |
-| --- | --- |
-| Events | `whatsapp.message.received` |
-| Payload version | `v2` |
-| Secret | Same value as `KAPSO_WEBHOOK_SECRET` |
+```bash
+kapso status
+kapso whatsapp numbers list --output json
+```
 
 Signature verification is on by default. For unsigned local fixtures only:
 
@@ -130,7 +153,41 @@ gateway:
         phone_number_id: "..."
 ```
 
-## Notes
+## Quick Troubleshooting
+
+If Hermes is not receiving messages:
+
+```bash
+hermes gateway status
+hermes kapso status
+curl http://127.0.0.1:8648/health
+tailscale funnel status
+journalctl --user -u hermes-gateway.service -f
+```
+
+Check that Tailscale Funnel proxies to `http://127.0.0.1:8648`, not an older
+bridge process. The public webhook should end in `/kapso/webhook`.
+
+Check that Kapso is sending `whatsapp.message.received` events with payload
+version `v2`, and that the webhook secret in Kapso matches
+`KAPSO_WEBHOOK_SECRET`.
+
+If the gateway log says no user allowlist is configured, add your WhatsApp ID:
+
+```bash
+hermes kapso setup --allowed-users 15551234567 --no-prompt
+hermes gateway restart
+```
+
+If outbound replies fail, confirm `KAPSO_API_KEY` and `KAPSO_PHONE_NUMBER_ID`
+are set:
+
+```bash
+hermes kapso status
+kapso whatsapp numbers list --output json
+```
+
+## Implementation Notes
 
 - `hermes plugins install ... --enable` prompts for `KAPSO_API_KEY` and
   `KAPSO_WEBHOOK_SECRET` automatically when they are missing.
