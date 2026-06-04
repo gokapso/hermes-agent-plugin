@@ -9,10 +9,17 @@ Hermes replies through Kapso's WhatsApp Cloud API proxy.
 Copy this directory into a Hermes platform plugin path:
 
 ```bash
-mkdir -p ~/.hermes/plugins/platforms
-cp -R /Users/rgaona/Documents/kapso-hermes-plugin ~/.hermes/plugins/platforms/kapso
-hermes plugins enable kapso-platform
+hermes plugins install gokapso/hermes-agent-plugin --enable
 ```
+
+For private-repo installs, use the SSH URL instead:
+
+```bash
+hermes plugins install git@github.com:gokapso/hermes-agent-plugin.git --enable
+```
+
+Hermes clones Git plugins into `~/.hermes/plugins/kapso` and loads them on the
+next session or gateway restart.
 
 Install the only runtime dependency if your Hermes environment does not already
 include it:
