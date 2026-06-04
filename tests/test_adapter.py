@@ -309,12 +309,12 @@ async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None
             FakeGetResponse(
                 text=(
                     '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=voice",'
-                    '"mime_type":"audio/ogg"}'
+                    '"mime_type":"audio/opus"}'
                 )
             ),
             FakeGetResponse(
                 body=b"OggSvoice-payload",
-                headers={"Content-Type": "audio/ogg; codecs=opus"},
+                headers={"Content-Type": "audio/opus"},
             ),
         ]
     )
@@ -325,7 +325,7 @@ async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None
             "id": "wamid.voice",
             "from": "15551234567",
             "type": "audio",
-            "audio": {"id": "media-voice", "mime_type": "audio/ogg", "voice": True},
+            "audio": {"id": "media-voice", "mime_type": "audio/opus", "voice": True},
         },
     }
 
@@ -335,7 +335,7 @@ async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None
 
     assert message_event.message_type.value == "voice"
     assert message_event.media_urls == ["/tmp/hermes-audio.ogg"]
-    assert message_event.media_types == ["audio/ogg"]
+    assert message_event.media_types == ["audio/opus"]
     assert kapso._session.calls[0] == (
         "https://api.kapso.ai/meta/whatsapp/v24.0/media-voice?phone_number_id=pn-123",
         {"headers": {"X-API-Key": "key"}},

@@ -215,7 +215,9 @@ hermes gateway restart
 ```
 
 For OpenAI Whisper/transcribe instead, add `VOICE_TOOLS_OPENAI_KEY` to
-`~/.hermes/.env` and restart the gateway.
+`~/.hermes/.env` and restart the gateway. If old logs show voice notes cached
+as `.opus`, update the plugin; Kapso voice notes are cached as `.ogg` for
+OpenAI STT compatibility.
 
 ## Implementation Notes
 

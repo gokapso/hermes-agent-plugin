@@ -90,7 +90,8 @@ _AUDIO_MIME_EXTENSIONS = {
     "audio/mpeg": ".mp3",
     "audio/mp3": ".mp3",
     "audio/ogg": ".ogg",
-    "audio/opus": ".opus",
+    # WhatsApp voice notes are Ogg Opus; OpenAI STT accepts .ogg uploads.
+    "audio/opus": ".ogg",
     "audio/wav": ".wav",
     "audio/webm": ".webm",
     "audio/x-m4a": ".m4a",
