@@ -344,6 +344,114 @@ async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None
     assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
 
 
+async def test_hydrates_document_media_into_hermes_document_cache(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter,
+        "_cache_document_bytes",
+        lambda data, filename: f"/tmp/hermes-documents/{filename}",
+    )
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                text=(
+                    '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=doc",'
+                    '"mime_type":"application/pdf"}'
+                )
+            ),
+            FakeGetResponse(
+                body=b"%PDF-1.7 invoice",
+                headers={"Content-Type": "application/pdf"},
+            ),
+        ]
+    )
+    payload = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.document",
+            "from": "15551234567",
+            "type": "document",
+            "document": {
+                "id": "media-doc",
+                "filename": "invoice.pdf",
+                "mime_type": "application/pdf",
+            },
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.message_type.value == "document"
+    assert message_event.media_urls == ["/tmp/hermes-documents/invoice.pdf"]
+    assert message_event.media_types == ["application/pdf"]
+    assert kapso._session.calls[0] == (
+        "https://api.kapso.ai/meta/whatsapp/v24.0/media-doc?phone_number_id=pn-123",
+        {"headers": {"X-API-Key": "key"}},
+    )
+    assert kapso._session.calls[1][0] == "https://api.kapso.ai/meta/whatsapp/media_download?token=doc"
+    assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
+
+
+async def test_hydrates_text_document_and_injects_content(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter,
+        "_cache_document_bytes",
+        lambda data, filename: f"/tmp/hermes-documents/{filename}",
+    )
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                body=b"alpha,beta\n1,2\n",
+                headers={"Content-Type": "text/csv"},
+            ),
+        ]
+    )
+    payload = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.csv",
+            "from": "15551234567",
+            "type": "document",
+            "document": {
+                "filename": "sample.csv",
+                "mime_type": "application/octet-stream",
+                "link": "https://cdn.example.com/sample.csv",
+                "caption": "Please inspect this data",
+            },
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.media_urls == ["/tmp/hermes-documents/sample.csv"]
+    assert message_event.media_types == ["text/csv"]
+    assert message_event.text == (
+        "[Content of sample.csv]:\nalpha,beta\n1,2\n\nPlease inspect this data"
+    )
+    assert kapso._session.calls == [
+        ("https://cdn.example.com/sample.csv", {"headers": {}})
+    ]
+
+
 def test_resolve_chat_id_accepts_encoded_and_plain_forms() -> None:
     kapso = adapter.KapsoAdapter(
         make_config(

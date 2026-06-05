@@ -59,6 +59,16 @@ try:
 except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
     _hermes_cache_audio_from_bytes = None
 
+try:
+    from gateway.platforms.base import cache_document_from_bytes as _hermes_cache_document_from_bytes
+except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
+    _hermes_cache_document_from_bytes = None
+
+try:
+    from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES as _hermes_supported_document_types
+except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
+    _hermes_supported_document_types = {}
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.kapso.ai/meta/whatsapp"
@@ -97,6 +107,67 @@ _AUDIO_MIME_EXTENSIONS = {
     "audio/webm": ".webm",
     "audio/x-m4a": ".m4a",
 }
+_FALLBACK_DOCUMENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".log": "text/plain",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".toml": "application/toml",
+    ".ini": "text/plain",
+    ".cfg": "text/plain",
+    ".zip": "application/zip",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".rtf": "application/rtf",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".tsv": "text/tab-separated-values",
+    ".py": "text/plain",
+    ".sh": "text/plain",
+    ".ts": "text/plain",
+}
+_DOCUMENT_EXT_MIME = {
+    **_FALLBACK_DOCUMENT_TYPES,
+    **(_hermes_supported_document_types if isinstance(_hermes_supported_document_types, dict) else {}),
+}
+_DOCUMENT_MIME_EXTENSIONS = {mime.lower(): ext for ext, mime in _DOCUMENT_EXT_MIME.items()}
+_DOCUMENT_MIME_EXTENSIONS.update(
+    {
+        "application/x-yaml": ".yaml",
+        "application/octet-stream": "",
+        "text/xml": ".xml",
+    }
+)
+_TEXT_DOCUMENT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".csv",
+    ".log",
+    ".json",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".tsv",
+    ".py",
+    ".sh",
+    ".ts",
+}
+MAX_TEXT_DOCUMENT_INLINE_BYTES = 100 * 1024
 
 
 class KapsoAdapter(BasePlatformAdapter):
@@ -434,8 +505,13 @@ class KapsoAdapter(BasePlatformAdapter):
         )
 
     async def _hydrate_media_event(self, event: MessageEvent, kapso_event: Dict[str, Any]) -> None:
-        """Download inbound media into Hermes' local caches for vision/STT."""
-        if event.message_type not in {MessageType.PHOTO, MessageType.AUDIO, MessageType.VOICE}:
+        """Download inbound media into Hermes' local caches for vision/STT/document tools."""
+        if event.message_type not in {
+            MessageType.PHOTO,
+            MessageType.AUDIO,
+            MessageType.VOICE,
+            MessageType.DOCUMENT,
+        }:
             return
         if getattr(event, "media_urls", None):
             return
@@ -448,7 +524,12 @@ class KapsoAdapter(BasePlatformAdapter):
         if not message:
             return
 
-        kind = "image" if event.message_type == MessageType.PHOTO else "audio"
+        if event.message_type == MessageType.PHOTO:
+            kind = "image"
+        elif event.message_type == MessageType.DOCUMENT:
+            kind = "document"
+        else:
+            kind = "audio"
         media = _record(message.get(kind))
         if not media:
             return
@@ -462,7 +543,7 @@ class KapsoAdapter(BasePlatformAdapter):
             )
             return
 
-        ext = _media_extension(kind, media, mime_type, default=".ogg" if kind == "audio" else ".jpg")
+        ext = _media_extension(kind, media, mime_type, default=_default_media_ext(kind))
         try:
             headers = _kapso_download_headers(media_url, self.api_key)
             async with self._session.get(media_url, headers=headers) as response:
@@ -489,9 +570,14 @@ class KapsoAdapter(BasePlatformAdapter):
             if kind == "image":
                 cached_path = _cache_image_bytes(data, ext)
                 default_mime = f"image/{ext.lstrip('.')}"
-            else:
+            elif kind == "audio":
                 cached_path = _cache_audio_bytes(data, ext)
                 default_mime = f"audio/{ext.lstrip('.')}"
+            else:
+                filename = _document_cache_filename(media, ext)
+                cached_path = _cache_document_bytes(data, filename)
+                default_mime = _DOCUMENT_EXT_MIME.get(ext, "application/octet-stream")
+                _inject_text_document_content(event, data, filename, ext)
         except Exception as exc:
             logger.warning("[kapso] failed to cache %s media %s: %s", kind, event.message_id, exc)
             return
@@ -1525,10 +1611,21 @@ def _media_extension(
     default: str = ".jpg",
 ) -> str:
     raw_mime = (mime_type or _read_str(media, "mime_type", "mimeType") or "").split(";", 1)[0]
-    mime_map = _AUDIO_MIME_EXTENSIONS if kind == "audio" else _IMAGE_MIME_EXTENSIONS
+    if kind == "audio":
+        mime_map = _AUDIO_MIME_EXTENSIONS
+    elif kind == "document":
+        mime_map = _DOCUMENT_MIME_EXTENSIONS
+    else:
+        mime_map = _IMAGE_MIME_EXTENSIONS
     ext = mime_map.get(raw_mime.strip().lower())
     if ext:
         return ext
+    filename = _read_str(media, "filename", "file_name", "name")
+    if filename:
+        suffix = Path(filename).suffix.lower()
+        allowed = set(mime_map.values())
+        if suffix in allowed:
+            return suffix
     link = _read_str(media, "link", "url")
     if link:
         suffix = Path(urlsplit(link).path).suffix.lower()
@@ -1538,6 +1635,25 @@ def _media_extension(
         if suffix in allowed:
             return suffix
     return default
+
+
+def _default_media_ext(kind: str) -> str:
+    if kind == "audio":
+        return ".ogg"
+    if kind == "document":
+        return ".bin"
+    return ".jpg"
+
+
+def _document_cache_filename(media: Dict[str, Any], ext: str) -> str:
+    raw_name = _read_str(media, "filename", "file_name", "name")
+    safe_name = Path(raw_name).name if raw_name else "document"
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = "document"
+    if not Path(safe_name).suffix and ext:
+        safe_name = f"{safe_name}{ext}"
+    return safe_name
 
 
 def _cache_image_bytes(data: bytes, ext: str) -> str:
@@ -1558,6 +1674,38 @@ def _cache_audio_bytes(data: bytes, ext: str) -> str:
     path = cache_dir / f"audio_{uuid.uuid4().hex[:12]}{ext}"
     path.write_bytes(data)
     return str(path)
+
+
+def _cache_document_bytes(data: bytes, filename: str) -> str:
+    if _hermes_cache_document_from_bytes is not None:
+        return _hermes_cache_document_from_bytes(data, filename)
+    cache_dir = Path(os.path.expanduser("~/.hermes/cache/documents"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(filename).name if filename else "document"
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = "document"
+    path = cache_dir / f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    if not path.resolve().is_relative_to(cache_dir.resolve()):
+        raise ValueError(f"Path traversal rejected: {filename!r}")
+    path.write_bytes(data)
+    return str(path)
+
+
+def _inject_text_document_content(event: MessageEvent, data: bytes, filename: str, ext: str) -> None:
+    if ext not in _TEXT_DOCUMENT_EXTENSIONS:
+        return
+    if len(data) > MAX_TEXT_DOCUMENT_INLINE_BYTES:
+        return
+    try:
+        text_content = data.decode("utf-8").rstrip()
+    except UnicodeDecodeError:
+        logger.warning("[kapso] could not decode text document %s as UTF-8", filename, exc_info=True)
+        return
+    display_name = re.sub(r"[^\w.\- ]", "_", Path(filename).name or "document")
+    injection = f"[Content of {display_name}]:\n{text_content}"
+    current = str(getattr(event, "text", "") or "")
+    event.text = f"{injection}\n\n{current}" if current else injection
 
 
 def _extract_kapso_events(payload: Any, *, batch_header: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -1,7 +1,7 @@
 name: kapso
 label: Kapso WhatsApp
 kind: platform
-version: 0.2.0
+version: 0.2.1
 description: >
   Kapso WhatsApp gateway adapter for Hermes Agent. Receives Kapso platform
   webhooks and sends replies through Kapso's WhatsApp Cloud API proxy.

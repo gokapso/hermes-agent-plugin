@@ -212,6 +212,17 @@ Healthy STT logs look like:
 Transcribed audio_....ogg via local whisper (base, lang=en, ...)
 ```
 
+## Documents
+
+Inbound WhatsApp documents are downloaded through Kapso, cached locally, and
+attached to Hermes as document media. Hermes receives the local file path so it
+can inspect PDFs, DOCX/XLSX/PPTX files, archives, and other supported document
+types with its normal document/tooling flow.
+
+Small text-like documents (`.txt`, `.md`, `.csv`, `.json`, `.yaml`, and similar)
+are also injected into the message text when they are under 100 KB, so the agent
+can answer simple questions without opening an extra file tool.
+
 ## Chat IDs
 
 Inbound sessions use encoded IDs:
@@ -316,6 +327,17 @@ For OpenAI Whisper/transcribe instead, add `VOICE_TOOLS_OPENAI_KEY` to
 as `.opus`, update the plugin; Kapso voice notes are cached as `.ogg` for
 OpenAI STT compatibility.
 
+If documents do not reach the agent, confirm they were cached:
+
+```bash
+grep -R "cached inbound document" ~/.hermes/logs/*.log
+find ~/.hermes/cache/documents ~/.hermes/document_cache -type f -mmin -10 -ls 2>/dev/null
+```
+
+Successful document ingestion logs `cached inbound document ...`. The cached
+file is usually under `~/.hermes/document_cache` or
+`~/.hermes/cache/documents`, depending on the Hermes runtime version.
+
 ## Implementation Notes
 
 - `hermes plugins install ... --enable` prompts only for `KAPSO_API_KEY`.
@@ -332,4 +354,7 @@ OpenAI STT compatibility.
   Hermes `MessageEvent.media_urls` for native vision processing.
 - Inbound audio and voice notes are downloaded through Kapso, cached locally,
   and attached to Hermes `MessageEvent.media_urls` for native STT processing.
-- Other non-image media currently lands as captions or descriptive placeholders.
+- Inbound documents are downloaded through Kapso, cached locally, and attached
+  to Hermes `MessageEvent.media_urls` for native document processing.
+- Other unsupported media currently lands as captions or descriptive
+  placeholders.
