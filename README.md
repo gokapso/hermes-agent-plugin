@@ -223,6 +223,13 @@ Small text-like documents (`.txt`, `.md`, `.csv`, `.json`, `.yaml`, and similar)
 are also injected into the message text when they are under 100 KB, so the agent
 can answer simple questions without opening an extra file tool.
 
+For PDFs and richer document formats, Hermes currently receives the cached file
+path and may ask for tool approval before extracting or inspecting the file. That
+approval prompt means the document reached Hermes; it is Hermes' document
+tooling path, not a Kapso webhook failure. Native "send this PDF directly to the
+model" behavior depends on Hermes core/provider document routing and is not
+enabled by this adapter alone.
+
 ## Chat IDs
 
 Inbound sessions use encoded IDs:
@@ -337,6 +344,11 @@ find ~/.hermes/cache/documents ~/.hermes/document_cache -type f -mmin -10 -ls 2>
 Successful document ingestion logs `cached inbound document ...`. The cached
 file is usually under `~/.hermes/document_cache` or
 `~/.hermes/cache/documents`, depending on the Hermes runtime version.
+
+If the agent responds with a dangerous-command approval prompt while reading a
+PDF, the document was delivered correctly and Hermes is trying to run its local
+extraction/inspection tool. Approving that command allows Hermes to read the
+cached file. Denying it leaves the agent with only the filename and caption.
 
 ## Implementation Notes
 
