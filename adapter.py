@@ -524,6 +524,10 @@ class KapsoAdapter(BasePlatformAdapter):
         if not message:
             return
 
+        if event.message_type in {MessageType.AUDIO, MessageType.VOICE} and _kapso_audio_transcript(message):
+            logger.info("[kapso] using Kapso transcript for inbound audio %s", event.message_id)
+            return
+
         if event.message_type == MessageType.PHOTO:
             kind = "image"
         elif event.message_type == MessageType.DOCUMENT:
@@ -1733,7 +1737,7 @@ def _message_text(message: Dict[str, Any]) -> str:
     if text and _read_str(text, "body"):
         return _read_str(text, "body") or ""
     kapso = _record(message.get("kapso")) or {}
-    transcript = _read_str(_record(kapso.get("transcript")), "text")
+    transcript = _kapso_audio_transcript(message)
     if transcript:
         return f"[voice] {transcript}"
     for media_key in ("image", "video", "document"):
@@ -1759,6 +1763,37 @@ def _message_text(message: Dict[str, Any]) -> str:
         value = _read_str(kapso, key)
         if value:
             return value
+    return ""
+
+
+def _kapso_audio_transcript(message: Dict[str, Any]) -> str:
+    msg_type = (_read_str(message, "type") or "").lower()
+    audio = _record(message.get("audio")) or {}
+    if msg_type not in {"audio", "voice"} and not audio:
+        return ""
+
+    kapso = _record(message.get("kapso")) or {}
+    for container in (
+        kapso.get("transcript"),
+        kapso.get("transcription"),
+        message.get("transcript"),
+        message.get("transcription"),
+        audio.get("transcript"),
+        audio.get("transcription"),
+    ):
+        if isinstance(container, str) and container.strip():
+            return container.strip()
+        record = _record(container)
+        if record:
+            value = _read_str(record, "text", "transcript", "body", "content", "value")
+            if value:
+                return value.strip()
+
+    content = _read_str(kapso, "content", "text")
+    if content:
+        match = re.search(r"(?:^|\n)\s*Transcript:\s*(.+)\s*$", content, flags=re.IGNORECASE | re.DOTALL)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
     return ""
 
 

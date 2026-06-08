@@ -209,8 +209,24 @@ def test_audio_transcript_and_media_description_text() -> None:
         "image": {"id": "media-2", "mime_type": "image/jpeg"},
         "kapso": {"media_url": "https://cdn.kapso.ai/media/image.jpg"},
     }
+    content_transcript_message = {
+        "id": "wamid.audio-content",
+        "from": "15551234567",
+        "type": "audio",
+        "audio": {"id": "media-3", "mime_type": "audio/opus", "voice": True},
+        "kapso": {
+            "content": (
+                "[Audio attached] (audio.ogg) [Size: 12 KB | Type: audio/opus] "
+                "URL: https://app.kapso.ai/audio.ogg\n"
+                "Transcript: I just spent 15 bucks in coffee, so please add that"
+            )
+        },
+    }
 
     assert adapter._message_text(transcript_message) == "[voice] please help"
+    assert adapter._message_text(content_transcript_message) == (
+        "[voice] I just spent 15 bucks in coffee, so please add that"
+    )
     assert (
         adapter._message_text(image_message)
         == "[image] (image/jpeg) https://cdn.kapso.ai/media/image.jpg"
@@ -342,6 +358,49 @@ async def test_hydrates_voice_media_into_hermes_audio_cache(monkeypatch) -> None
     )
     assert kapso._session.calls[1][0] == "https://api.kapso.ai/meta/whatsapp/media_download?token=voice"
     assert kapso._session.calls[1][1] == {"headers": {"X-API-Key": "key"}}
+
+
+async def test_skips_voice_hydration_when_kapso_transcript_exists() -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                text=(
+                    '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=voice",'
+                    '"mime_type":"audio/opus"}'
+                )
+            ),
+        ]
+    )
+    payload = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.voice-transcript",
+            "from": "15551234567",
+            "type": "audio",
+            "audio": {"id": "media-voice", "mime_type": "audio/opus", "voice": True},
+            "kapso": {
+                "transcript": {"text": "Reply with the word turtle"},
+                "media_url": "https://api.kapso.ai/meta/whatsapp/media_download?token=voice",
+            },
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+    assert message_event.message_type.value == "voice"
+    assert message_event.text == "[voice] Reply with the word turtle"
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert getattr(message_event, "media_urls", None) is None
+    assert kapso._session.calls == []
 
 
 async def test_hydrates_document_media_into_hermes_document_cache(monkeypatch) -> None:

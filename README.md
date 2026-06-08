@@ -160,9 +160,15 @@ KAPSO_VERIFY_WEBHOOK_SIGNATURES=false
 
 ## Voice Notes
 
-Inbound WhatsApp voice notes are downloaded through Kapso, cached as `.ogg`,
-and passed to Hermes as audio media. Hermes then transcribes them with its STT
-provider before the agent turn.
+Inbound WhatsApp voice notes use Kapso's transcript when the webhook payload
+includes one. In that path, the adapter sends the transcript text straight to
+Hermes and skips audio attachment, so users do not need `faster-whisper` or an
+OpenAI transcription key for those messages.
+
+If Kapso has not provided a transcript in the webhook payload, the adapter falls
+back to downloading the voice note through Kapso, caching it as `.ogg`, and
+passing it to Hermes as audio media. Hermes then transcribes it with its
+configured STT provider before the agent turn.
 
 For local, no-key transcription with `faster-whisper`:
 
@@ -202,10 +208,16 @@ Verify voice-note processing:
 
 ```bash
 tail -f ~/.hermes/logs/gateway.log ~/.hermes/logs/agent.log \
-  | grep --line-buffered -iE 'kapso|audio|voice|stt|transcrib|whisper|openai'
+  | grep --line-buffered -iE 'kapso|audio|voice|stt|transcrib|transcript|whisper|openai'
 ```
 
-Healthy STT logs look like:
+Healthy Kapso-transcript logs look like:
+
+```text
+[kapso] using Kapso transcript for inbound audio ...
+```
+
+Healthy STT fallback logs look like:
 
 ```text
 [kapso] cached inbound audio ... at ~/.hermes/audio_cache/audio_....ogg
@@ -312,17 +324,20 @@ Hermes runtime version. If you only see `image message ... has no downloadable
 media URL yet`, confirm the webhook payload includes either
 `kapso.mediaUrl`/`kapso.media_url` or an image media `id`.
 
-If voice notes do not transcribe, first confirm the plugin cached the audio:
+If voice notes do not transcribe, first confirm whether Kapso supplied a
+transcript or the plugin cached the audio fallback:
 
 ```bash
-grep -R "cached inbound audio\|User sent audio\|STT" ~/.hermes/logs/*.log
+grep -R "using Kapso transcript\|cached inbound audio\|User sent audio\|STT" ~/.hermes/logs/*.log
 find ~/.hermes/cache/audio ~/.hermes/audio_cache -type f -mmin -10 -ls 2>/dev/null
 ```
 
-Successful voice-note ingestion logs `cached inbound audio ...`. The cached
-file is usually under `~/.hermes/audio_cache` or `~/.hermes/cache/audio`.
-Hermes then uses its configured STT provider to transcribe the cached file. For
-a no-key local STT provider:
+Successful Kapso transcript ingestion logs `using Kapso transcript ...` and does
+not require a local or OpenAI STT provider. If no transcript is present,
+successful fallback ingestion logs `cached inbound audio ...`. The cached file
+is usually under `~/.hermes/audio_cache` or `~/.hermes/cache/audio`. Hermes then
+uses its configured STT provider to transcribe the cached file. For a no-key
+local STT provider:
 
 ```bash
 ~/.hermes/hermes-agent/venv/bin/python -m pip install -U faster-whisper
