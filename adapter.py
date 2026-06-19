@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -32,12 +33,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlencode, urlsplit
 
 try:
-    from aiohttp import ClientSession, ClientTimeout, web
+    from aiohttp import ClientSession, ClientTimeout, FormData, web
 
     AIOHTTP_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised by Hermes runtime checks
     ClientSession = None  # type: ignore[assignment]
     ClientTimeout = None  # type: ignore[assignment]
+    FormData = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
     AIOHTTP_AVAILABLE = False
 
@@ -309,7 +311,7 @@ class KapsoAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a text message to a WhatsApp recipient via Kapso."""
-        del reply_to, metadata
+        del reply_to
         if not self._session:
             return SendResult(success=False, error="Kapso adapter is not connected", retryable=True)
 
@@ -330,7 +332,8 @@ class KapsoAdapter(BasePlatformAdapter):
             )
 
         text = _to_whatsapp_text(content or "")
-        chunks = _split_text(text, MAX_WHATSAPP_TEXT_LENGTH) or [" "]
+        media_items = _outbound_media_items(metadata)
+        chunks = _split_text(text, MAX_WHATSAPP_TEXT_LENGTH) or ([] if media_items else [" "])
         message_ids: List[str] = []
         raw_responses: List[Any] = []
         for chunk in chunks:
@@ -353,12 +356,196 @@ class KapsoAdapter(BasePlatformAdapter):
                 )
             if result.get("message_id"):
                 message_ids.append(str(result["message_id"]))
+        for media_item in media_items:
+            result = await _send_media_file_via_kapso(
+                session=self._session,
+                base_url=self.base_url,
+                graph_version=self.graph_version,
+                api_key=self.api_key,
+                phone_number_id=phone_number_id,
+                recipient=recipient,
+                file_path=media_item["file_path"],
+                caption=media_item.get("caption"),
+                filename=media_item.get("filename"),
+                preferred_kind=media_item.get("preferred_kind"),
+                force_document=bool(media_item.get("force_document")),
+            )
+            raw_responses.append(result.get("raw"))
+            if result.get("error"):
+                return SendResult(
+                    success=False,
+                    error=str(result["error"]),
+                    raw_response=result.get("raw"),
+                    retryable=bool(result.get("retryable")),
+                )
+            if result.get("message_id"):
+                message_ids.append(str(result["message_id"]))
 
         return SendResult(
             success=True,
             message_id=message_ids[-1] if message_ids else None,
             continuation_message_ids=tuple(message_ids[:-1]),
             raw_response=raw_responses,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file to a WhatsApp recipient via Kapso."""
+        del reply_to, metadata
+        file_path = image_path or kwargs.pop("file_path", None)
+        if not file_path:
+            return SendResult(success=False, error="image_path is required")
+        return await self._send_media_file(chat_id, file_path, caption=caption, preferred_kind="image")
+
+    async def send_audio_file(
+        self,
+        chat_id: str,
+        audio_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local audio file to a WhatsApp recipient via Kapso."""
+        del reply_to, metadata
+        file_path = audio_path or kwargs.pop("file_path", None)
+        if not file_path:
+            return SendResult(success=False, error="audio_path is required")
+        return await self._send_media_file(chat_id, file_path, caption=caption, preferred_kind="audio")
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        voice_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local voice/audio file to a WhatsApp recipient via Kapso."""
+        return await self.send_audio_file(
+            chat_id,
+            voice_path or kwargs.pop("audio_path", None),
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
+
+    async def send_video_file(
+        self,
+        chat_id: str,
+        video_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local video file to a WhatsApp recipient via Kapso."""
+        del reply_to, metadata
+        file_path = video_path or kwargs.pop("file_path", None)
+        if not file_path:
+            return SendResult(success=False, error="video_path is required")
+        return await self._send_media_file(chat_id, file_path, caption=caption, preferred_kind="video")
+
+    async def send_sticker_file(
+        self,
+        chat_id: str,
+        sticker_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local sticker file to a WhatsApp recipient via Kapso."""
+        del caption, reply_to, metadata
+        file_path = sticker_path or kwargs.pop("file_path", None)
+        if not file_path:
+            return SendResult(success=False, error="sticker_path is required")
+        return await self._send_media_file(chat_id, file_path, preferred_kind="sticker")
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: Optional[str] = None,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local document file to a WhatsApp recipient via Kapso."""
+        del reply_to, metadata
+        if not file_path:
+            return SendResult(success=False, error="file_path is required")
+        return await self._send_media_file(
+            chat_id,
+            file_path,
+            caption=caption,
+            filename=file_name or kwargs.pop("filename", None),
+            force_document=True,
+        )
+
+    async def _send_media_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        preferred_kind: Optional[str] = None,
+        force_document: bool = False,
+    ) -> SendResult:
+        if not self._session:
+            return SendResult(success=False, error="Kapso adapter is not connected", retryable=True)
+
+        resolved = self._resolve_chat_id(chat_id)
+        if not resolved:
+            return SendResult(
+                success=False,
+                error=(
+                    "Kapso chat_id must be a WhatsApp recipient number, "
+                    "phone_number_id:recipient, or kapso:<encoded_phone>:<encoded_recipient>"
+                ),
+            )
+        phone_number_id, recipient = resolved
+        if not phone_number_id:
+            return SendResult(
+                success=False,
+                error="KAPSO_PHONE_NUMBER_ID is required when chat_id does not include a phone number ID",
+            )
+
+        result = await _send_media_file_via_kapso(
+            session=self._session,
+            base_url=self.base_url,
+            graph_version=self.graph_version,
+            api_key=self.api_key,
+            phone_number_id=phone_number_id,
+            recipient=recipient,
+            file_path=file_path,
+            caption=caption,
+            filename=filename,
+            preferred_kind=preferred_kind,
+            force_document=force_document,
+        )
+        if result.get("error"):
+            return SendResult(
+                success=False,
+                error=str(result["error"]),
+                raw_response=result.get("raw"),
+                retryable=bool(result.get("retryable")),
+            )
+        return SendResult(
+            success=True,
+            message_id=str(result["message_id"]) if result.get("message_id") else None,
+            raw_response=result.get("raw"),
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -790,7 +977,7 @@ async def _standalone_send(
     force_document: bool = False,
 ) -> Dict[str, Any]:
     """Out-of-process delivery for cron jobs and send_message fallbacks."""
-    del thread_id, force_document
+    del thread_id
     if not AIOHTTP_AVAILABLE:
         return {"error": "Kapso standalone send: aiohttp is not installed"}
     extra = getattr(pconfig, "extra", {}) or {}
@@ -827,14 +1014,17 @@ async def _standalone_send(
         return {"error": "Kapso standalone send: KAPSO_PHONE_NUMBER_ID is required"}
 
     text = _to_whatsapp_text(message or "")
-    if media_files:
-        text = f"{text}\n\n[{len(media_files)} attachment(s) generated; send media via a live gateway adapter.]".strip()
-    chunks = _split_text(text, MAX_WHATSAPP_TEXT_LENGTH) or [" "]
+    chunks = _split_text(text, MAX_WHATSAPP_TEXT_LENGTH)
+    media_items = (
+        [_media_item_from_value(item) for item in media_files]
+        if isinstance(media_files, (list, tuple))
+        else ([_media_item_from_value(media_files)] if media_files else [])
+    )
 
     message_ids: List[str] = []
     timeout = ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT_SECONDS)
     async with ClientSession(timeout=timeout) as session:
-        for chunk in chunks:
+        for chunk in chunks or ([] if media_items else [" "]):
             result = await _send_text_via_kapso(
                 session=session,
                 base_url=base_url,
@@ -843,6 +1033,24 @@ async def _standalone_send(
                 phone_number_id=phone_number_id,
                 recipient=recipient,
                 body=chunk,
+            )
+            if result.get("error"):
+                return {"error": f"Kapso standalone send failed: {result['error']}"}
+            if result.get("message_id"):
+                message_ids.append(str(result["message_id"]))
+        for media_item in media_items:
+            result = await _send_media_file_via_kapso(
+                session=session,
+                base_url=base_url,
+                graph_version=graph_version,
+                api_key=api_key,
+                phone_number_id=phone_number_id,
+                recipient=recipient,
+                file_path=media_item["file_path"],
+                caption=media_item.get("caption"),
+                filename=media_item.get("filename"),
+                preferred_kind=media_item.get("preferred_kind"),
+                force_document=force_document or bool(media_item.get("force_document")),
             )
             if result.get("error"):
                 return {"error": f"Kapso standalone send failed: {result['error']}"}
@@ -1552,6 +1760,110 @@ async def _send_text_via_kapso(
         return {"error": str(exc), "retryable": True}
 
 
+async def _send_media_file_via_kapso(
+    *,
+    session,
+    base_url: str,
+    graph_version: str,
+    api_key: str,
+    phone_number_id: str,
+    recipient: str,
+    file_path: str,
+    caption: Optional[str] = None,
+    filename: Optional[str] = None,
+    preferred_kind: Optional[str] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    try:
+        media = _classify_outbound_media(
+            file_path,
+            filename=filename,
+            preferred_kind=preferred_kind,
+            force_document=force_document,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if FormData is None:
+        return {"error": "Kapso media upload: aiohttp FormData is not installed"}
+
+    data = FormData()
+    data.add_field("messaging_product", "whatsapp")
+    try:
+        with media["path"].open("rb") as fh:
+            data.add_field(
+                "file",
+                fh,
+                filename=media["filename"],
+                content_type=media["mime_type"],
+            )
+            async with session.post(
+                _media_upload_url(base_url, graph_version, phone_number_id),
+                data=data,
+                headers={"X-API-Key": api_key},
+            ) as response:
+                raw: Any
+                try:
+                    raw = await response.json(content_type=None)
+                except Exception:
+                    raw = await response.text()
+                if response.status >= 300:
+                    return {
+                        "error": f"Kapso media upload HTTP {response.status}: {_compact(raw)}",
+                        "raw": raw,
+                        "retryable": response.status >= 500,
+                    }
+                media_id = _read_str(_record(raw), "id", "media_id")
+                if not media_id:
+                    return {"error": "Kapso media upload returned no media id", "raw": raw}
+                upload_raw = raw
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"error": str(exc), "retryable": True}
+
+    media_payload: Dict[str, Any] = {"id": media_id}
+    clean_caption = _to_whatsapp_text(caption or "").strip()
+    if clean_caption and media["kind"] in {"image", "video", "document"}:
+        media_payload["caption"] = clean_caption
+    if media["kind"] == "document":
+        media_payload["filename"] = media["filename"]
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": media["kind"],
+        media["kind"]: media_payload,
+    }
+    try:
+        async with session.post(
+            _messages_url(base_url, graph_version, phone_number_id),
+            json=payload,
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        ) as response:
+            raw: Any
+            try:
+                raw = await response.json(content_type=None)
+            except Exception:
+                raw = await response.text()
+            if response.status >= 300:
+                return {
+                    "error": f"Kapso media send HTTP {response.status}: {_compact(raw)}",
+                    "raw": raw,
+                    "retryable": response.status >= 500,
+                }
+            return {
+                "success": True,
+                "message_id": _message_id_from_response(raw),
+                "raw": {"upload": upload_raw, "send": raw},
+            }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"error": str(exc), "retryable": True}
+
+
 async def _mark_read_typing(
     *,
     session,
@@ -1580,6 +1892,13 @@ def _messages_url(base_url: str, graph_version: str, phone_number_id: str) -> st
     if not _GRAPH_VERSION_RE.search(base):
         base = f"{base}/{_strip_slashes(graph_version)}"
     return f"{base}/{quote(str(phone_number_id), safe='')}/messages"
+
+
+def _media_upload_url(base_url: str, graph_version: str, phone_number_id: str) -> str:
+    base = _normalize_base_url(base_url)
+    if not _GRAPH_VERSION_RE.search(base):
+        base = f"{base}/{_strip_slashes(graph_version)}"
+    return f"{base}/{quote(str(phone_number_id), safe='')}/media"
 
 
 def _build_media_metadata_url(
@@ -1639,6 +1958,105 @@ def _media_extension(
         if suffix in allowed:
             return suffix
     return default
+
+
+def _outbound_media_items(metadata: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return []
+    for key in ("media_files", "attachments", "files", "media"):
+        value = metadata.get(key)
+        if isinstance(value, (list, tuple)):
+            return [_media_item_from_value(item) for item in value]
+        if value:
+            return [_media_item_from_value(value)]
+    for key in ("media_file", "attachment", "file"):
+        value = metadata.get(key)
+        if value:
+            return [_media_item_from_value(value)]
+    if any(key in metadata for key in ("file_path", "path", "local_path")):
+        return [_media_item_from_value(metadata)]
+    return []
+
+
+def _media_item_from_value(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        file_path = _first_nonempty(value.get("file_path"), value.get("path"), value.get("local_path"))
+        if not file_path:
+            file_path = _media_file_path(value.get("file"))
+        item = {
+            "file_path": str(file_path or ""),
+            "caption": _first_nonempty(value.get("caption"), value.get("text")),
+            "filename": _first_nonempty(value.get("filename"), value.get("name")),
+            "preferred_kind": _preferred_media_kind(value.get("kind"), value.get("type"), value.get("message_type")),
+            "force_document": _coerce_bool(value.get("force_document"), default=False),
+        }
+        return item
+    return {
+        "file_path": _media_file_path(value),
+        "caption": None,
+        "filename": None,
+        "preferred_kind": None,
+        "force_document": False,
+    }
+
+
+def _media_file_path(media_file: Any) -> str:
+    if isinstance(media_file, (list, tuple)):
+        return str(media_file[0] if media_file else "")
+    return str(media_file or "")
+
+
+def _preferred_media_kind(*values: Any) -> Optional[str]:
+    for value in values:
+        raw = str(value or "").strip().lower()
+        if raw in {"image", "photo"}:
+            return "image"
+        if raw in {"audio", "voice"}:
+            return "audio"
+        if raw in {"video", "movie"}:
+            return "video"
+        if raw == "sticker":
+            return "sticker"
+        if raw in {"document", "file"}:
+            return "document"
+    return None
+
+
+def _classify_outbound_media(
+    file_path: str,
+    *,
+    filename: Optional[str] = None,
+    preferred_kind: Optional[str] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    path = Path(file_path).expanduser()
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"Media file not found: {file_path}")
+
+    safe_filename = Path(filename).name if filename else path.name
+    safe_filename = safe_filename.replace("\x00", "").strip()
+    if not safe_filename or safe_filename in {".", ".."}:
+        safe_filename = "attachment"
+
+    mime_type = mimetypes.guess_type(safe_filename or path.name)[0] or "application/octet-stream"
+    kind = "document"
+    if force_document:
+        kind = "document"
+    elif preferred_kind in {"image", "audio", "video", "sticker", "document"}:
+        kind = preferred_kind
+    elif mime_type.lower().startswith("image/"):
+        kind = "image"
+    elif mime_type.lower().startswith("audio/"):
+        kind = "audio"
+    elif mime_type.lower().startswith("video/"):
+        kind = "video"
+
+    return {
+        "path": path,
+        "filename": safe_filename,
+        "mime_type": mime_type,
+        "kind": kind,
+    }
 
 
 def _default_media_ext(kind: str) -> str:

@@ -526,6 +526,10 @@ def test_resolve_chat_id_accepts_encoded_and_plain_forms() -> None:
     assert kapso._resolve_chat_id("+1 (555) 123-4567") == ("pn-default", "+15551234567")
 
 
+def test_media_item_from_value_accepts_file_key() -> None:
+    assert adapter._media_item_from_value({"file": "/tmp/report.pdf"})["file_path"] == "/tmp/report.pdf"
+
+
 def test_extract_phone_numbers_from_cli_shapes() -> None:
     payload = {
         "data": [
@@ -589,6 +593,45 @@ class FakeSession:
         return FakeResponse()
 
 
+class FakePostResponse:
+    def __init__(self, payload, *, status=200):
+        self.payload = payload
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self, content_type=None):
+        return self.payload
+
+    async def text(self):
+        return "ok"
+
+
+class FakePostSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.responses.pop(0)
+
+
+class FakeContext:
+    def __init__(self, value):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 async def test_send_posts_text_to_kapso_proxy() -> None:
     kapso = adapter.KapsoAdapter(
         make_config(
@@ -608,6 +651,339 @@ async def test_send_posts_text_to_kapso_proxy() -> None:
     assert kwargs["headers"]["X-API-Key"] == "key"
     assert kwargs["json"]["to"] == "15551234567"
     assert kwargs["json"]["text"]["body"] == "Hello *world* docs (https://example.com)"
+
+
+async def test_send_image_file_uploads_and_sends_media(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-123"}),
+            FakePostResponse({"messages": [{"id": "wamid.media"}]}),
+        ]
+    )
+
+    result = await kapso.send_image_file("15551234567", str(image), caption="Here is **the chart**")
+
+    assert result.success is True
+    assert result.message_id == "wamid.media"
+    upload_url, upload_kwargs = kapso._session.calls[0]
+    assert upload_url == "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/media"
+    assert upload_kwargs["headers"] == {"X-API-Key": "key"}
+    send_url, send_kwargs = kapso._session.calls[1]
+    assert send_url == "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages"
+    assert send_kwargs["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "image",
+        "image": {"id": "media-123", "caption": "Here is *the chart*"},
+    }
+
+
+async def test_send_image_file_keeps_image_kind_without_extension(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    image = tmp_path / "chart"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-123"}),
+            FakePostResponse({"messages": [{"id": "wamid.media"}]}),
+        ]
+    )
+
+    result = await kapso.send_image_file("15551234567", str(image))
+
+    assert result.success is True
+    assert kapso._session.calls[1][1]["json"]["type"] == "image"
+    assert kapso._session.calls[1][1]["json"]["image"] == {"id": "media-123"}
+
+
+async def test_send_image_file_accepts_hermes_image_path_kwarg(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\npayload")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-123"}),
+            FakePostResponse({"messages": [{"id": "wamid.media"}]}),
+        ]
+    )
+
+    result = await kapso.send_image_file("15551234567", image_path=str(image))
+
+    assert result.success is True
+    assert kapso._session.calls[1][1]["json"]["type"] == "image"
+
+
+async def test_send_audio_file_uploads_and_sends_audio(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    audio = tmp_path / "reply.mp3"
+    audio.write_bytes(b"ID3payload")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-audio"}),
+            FakePostResponse({"messages": [{"id": "wamid.audio"}]}),
+        ]
+    )
+
+    result = await kapso.send_audio_file("15551234567", str(audio), caption="ignored")
+
+    assert result.success is True
+    assert kapso._session.calls[1][1]["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "audio",
+        "audio": {"id": "media-audio"},
+    }
+
+
+async def test_metadata_video_and_sticker_use_native_media_kinds(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    video = tmp_path / "clip.mp4"
+    sticker = tmp_path / "sticker.webp"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    sticker.write_bytes(b"RIFFxxxxWEBP")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-video"}),
+            FakePostResponse({"messages": [{"id": "wamid.video"}]}),
+            FakePostResponse({"id": "media-sticker"}),
+            FakePostResponse({"messages": [{"id": "wamid.sticker"}]}),
+        ]
+    )
+
+    result = await kapso.send(
+        "15551234567",
+        "",
+        metadata={
+            "media_files": [
+                {"file_path": str(video), "caption": "Watch **this**"},
+                {"file_path": str(sticker), "kind": "sticker", "caption": "ignored"},
+            ]
+        },
+    )
+
+    assert result.success is True
+    assert kapso._session.calls[1][1]["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "video",
+        "video": {"id": "media-video", "caption": "Watch *this*"},
+    }
+    assert kapso._session.calls[3][1]["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "sticker",
+        "sticker": {"id": "media-sticker"},
+    }
+
+
+async def test_send_document_accepts_hermes_file_name_kwarg(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-doc"}),
+            FakePostResponse({"messages": [{"id": "wamid.doc"}]}),
+        ]
+    )
+
+    result = await kapso.send_document("15551234567", str(document), file_name="renamed.pdf")
+
+    assert result.success is True
+    assert kapso._session.calls[1][1]["json"]["document"] == {
+        "id": "media-doc",
+        "filename": "renamed.pdf",
+    }
+
+
+async def test_send_uses_metadata_media_files(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"messages": [{"id": "wamid.text"}]}),
+            FakePostResponse({"id": "media-doc"}),
+            FakePostResponse({"messages": [{"id": "wamid.doc"}]}),
+        ]
+    )
+
+    result = await kapso.send(
+        "15551234567",
+        "Done",
+        metadata={"media_files": [str(document)]},
+    )
+
+    assert result.success is True
+    assert result.message_id == "wamid.doc"
+    assert result.continuation_message_ids == ("wamid.text",)
+    assert [call[0] for call in kapso._session.calls] == [
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/media",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+    ]
+    assert kapso._session.calls[2][1]["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "document",
+        "document": {"id": "media-doc", "filename": "report.pdf"},
+    }
+
+
+async def test_send_uses_single_attachment_dict(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-doc"}),
+            FakePostResponse({"messages": [{"id": "wamid.doc"}]}),
+        ]
+    )
+
+    result = await kapso.send(
+        "15551234567",
+        "",
+        metadata={"attachments": {"file_path": str(document)}},
+    )
+
+    assert result.success is True
+    assert result.message_id == "wamid.doc"
+    assert [call[0] for call in kapso._session.calls] == [
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/media",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+    ]
+
+
+async def test_standalone_send_uploads_media_files(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(adapter, "ClientTimeout", lambda total=None: None)
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    fake_session = FakePostSession(
+        [
+            FakePostResponse({"messages": [{"id": "wamid.text"}]}),
+            FakePostResponse({"id": "media-doc"}),
+            FakePostResponse({"messages": [{"id": "wamid.doc"}]}),
+        ]
+    )
+    monkeypatch.setattr(adapter, "ClientSession", lambda timeout=None: FakeContext(fake_session))
+
+    result = await adapter._standalone_send(
+        make_config(api_key="key", phone_number_id="pn-default"),
+        "15551234567",
+        "Done",
+        media_files=[str(document)],
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "wamid.doc"
+    assert [call[0] for call in fake_session.calls] == [
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/media",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+    ]
+    assert fake_session.calls[2][1]["json"] == {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": "15551234567",
+        "type": "document",
+        "document": {"id": "media-doc", "filename": "report.pdf"},
+    }
+
+
+async def test_standalone_send_accepts_single_media_file_string(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(adapter, "ClientTimeout", lambda total=None: None)
+    monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    fake_session = FakePostSession(
+        [
+            FakePostResponse({"id": "media-doc"}),
+            FakePostResponse({"messages": [{"id": "wamid.doc"}]}),
+        ]
+    )
+    monkeypatch.setattr(adapter, "ClientSession", lambda timeout=None: FakeContext(fake_session))
+
+    result = await adapter._standalone_send(
+        make_config(api_key="key", phone_number_id="pn-default"),
+        "15551234567",
+        "",
+        media_files=str(document),
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "wamid.doc"
+    assert [call[0] for call in fake_session.calls] == [
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/media",
+        "https://api.kapso.ai/meta/whatsapp/v24.0/pn-default/messages",
+    ]
 
 
 def test_register_supplies_platform_hooks() -> None:
