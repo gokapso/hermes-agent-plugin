@@ -439,7 +439,7 @@ class KapsoAdapter(BasePlatformAdapter):
             **kwargs,
         )
 
-    async def send_video_file(
+    async def send_video(
         self,
         chat_id: str,
         video_path: Optional[str] = None,
