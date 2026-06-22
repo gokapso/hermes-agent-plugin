@@ -263,6 +263,16 @@ or an explicit phone number ID and recipient:
 <phone_number_id>:15551234567
 ```
 
+## Outbound Files
+
+Hermes outbound `MEDIA:/absolute/path` attachments are sent through Kapso's Meta
+proxy, then delivered with the returned WhatsApp media ID.
+
+Images, audio, video, and documents use the matching WhatsApp media message type.
+Other local files are sent as WhatsApp `document` messages. WhatsApp stickers are
+supported only when explicitly sent as sticker media; Hermes `MEDIA:/path.webp`
+attachments are treated as images by Hermes.
+
 ## Config YAML
 
 Environment variables are the easiest path, but this also works:
