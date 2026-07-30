@@ -131,6 +131,26 @@ install_gateway_stubs()
 adapter = importlib.import_module("adapter")
 
 
+def load_plugin_package():
+    parent_name = "hermes_plugins"
+    parent = types.ModuleType(parent_name)
+    parent.__path__ = []
+    sys.modules[parent_name] = parent
+
+    module_name = f"{parent_name}.kapso_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        ROOT / "__init__.py",
+        submodule_search_locations=[str(ROOT)],
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def make_config(**extra):
     platform_config = sys.modules["gateway.config"].PlatformConfig
     return platform_config(extra=extra)
@@ -144,6 +164,16 @@ def test_verify_kapso_signature_accepts_sha256_prefix() -> None:
     assert adapter.verify_kapso_signature(raw, f"sha256={digest}", secret)
     assert adapter.verify_kapso_signature(raw, digest, secret)
     assert not adapter.verify_kapso_signature(raw, "sha256=bad", secret)
+
+
+async def test_connect_accepts_hermes_reconnect_keyword(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "AIOHTTP_AVAILABLE", False)
+    kapso = adapter.KapsoAdapter(make_config())
+
+    connected = await kapso.connect(is_reconnect=True)
+
+    assert connected is False
+    assert kapso.fatal == ("missing_dependency", "aiohttp is not installed", False)
 
 
 def test_kapso_webhook_event_becomes_message_event() -> None:
@@ -990,6 +1020,8 @@ def test_register_supplies_platform_hooks() -> None:
     class Ctx:
         kwargs = None
         cli_kwargs = None
+        skill_args = None
+        tool_kwargs = None
 
         def register_platform(self, **kwargs):
             self.kwargs = kwargs
@@ -997,8 +1029,15 @@ def test_register_supplies_platform_hooks() -> None:
         def register_cli_command(self, **kwargs):
             self.cli_kwargs = kwargs
 
+        def register_skill(self, *args, **kwargs):
+            self.skill_args = (args, kwargs)
+
+        def register_tool(self, **kwargs):
+            self.tool_kwargs = kwargs
+
     ctx = Ctx()
-    adapter.register(ctx)
+    plugin = load_plugin_package()
+    plugin.register(ctx)
 
     assert ctx.kwargs["name"] == "kapso"
     assert ctx.kwargs["required_env"] == ["KAPSO_API_KEY"]
@@ -1008,3 +1047,8 @@ def test_register_supplies_platform_hooks() -> None:
     assert ctx.kwargs["max_message_length"] == adapter.MAX_WHATSAPP_TEXT_LENGTH
     assert ctx.cli_kwargs["name"] == "kapso"
     assert callable(ctx.cli_kwargs["setup_fn"])
+    assert ctx.tool_kwargs["name"] == "xquik_search"
+    assert ctx.tool_kwargs["requires_env"] == ["XQUIK_API_KEY"]
+    assert callable(ctx.tool_kwargs["handler"])
+    assert ctx.skill_args[0][0] == "xquik-social-research"
+    assert ctx.skill_args[0][1].is_file()

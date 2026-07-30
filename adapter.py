@@ -252,8 +252,9 @@ class KapsoAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Kapso"
 
-    async def connect(self) -> bool:
-        """Start the Kapso webhook listener and prepare outbound HTTP."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Start the webhook listener; Kapso push delivery has no reconnect queue."""
+        del is_reconnect
         if not AIOHTTP_AVAILABLE:
             self._set_fatal_error("missing_dependency", "aiohttp is not installed", retryable=False)
             logger.error("[kapso] aiohttp is required. Install with: pip install aiohttp")

@@ -43,3 +43,10 @@ hermes kapso status
 kapso status
 kapso whatsapp numbers list --output json
 ```
+
+Optional: set `XQUIK_API_KEY` and restart the gateway to enable read-only X
+search through the `xquik_search` tool. Load
+`kapso:xquik-social-research` for the bundled research workflow.
+
+Xquik is an independent third-party service. Not affiliated with X Corp.
+"Twitter" and "X" are trademarks of X Corp.

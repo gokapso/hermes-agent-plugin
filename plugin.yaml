@@ -1,11 +1,13 @@
 name: kapso
 label: Kapso WhatsApp
 kind: platform
-version: 0.2.2
+version: 0.2.3
 description: >
   Kapso WhatsApp gateway adapter for Hermes Agent. Receives Kapso platform
   webhooks and sends replies through Kapso's WhatsApp Cloud API proxy.
 author: Kapso
+provides_tools:
+  - xquik_search
 requires_env:
   - name: KAPSO_API_KEY
     description: "Kapso API key used for outbound WhatsApp sends"
@@ -13,6 +15,13 @@ requires_env:
     url: "https://kapso.ai/"
     password: true
 optional_env:
+  - name: XQUIK_API_KEY
+    description: >
+      Optional Xquik API key for read-only X search. Not affiliated with X
+      Corp.
+    prompt: "Xquik API key"
+    url: "https://xquik.com/"
+    password: true
   - name: KAPSO_WEBHOOK_SECRET
     description: "Secret used to verify Kapso X-Webhook-Signature webhook deliveries"
     prompt: "Kapso webhook secret"
