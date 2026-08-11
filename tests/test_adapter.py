@@ -146,6 +146,16 @@ def test_verify_kapso_signature_accepts_sha256_prefix() -> None:
     assert not adapter.verify_kapso_signature(raw, "sha256=bad", secret)
 
 
+async def test_connect_accepts_hermes_reconnect_keyword(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "AIOHTTP_AVAILABLE", False)
+    kapso = adapter.KapsoAdapter(make_config())
+
+    connected = await kapso.connect(is_reconnect=True)
+
+    assert connected is False
+    assert kapso.fatal == ("missing_dependency", "aiohttp is not installed", False)
+
+
 def test_kapso_webhook_event_becomes_message_event() -> None:
     kapso = adapter.KapsoAdapter(
         make_config(
