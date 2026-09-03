@@ -663,6 +663,112 @@ async def test_send_posts_text_to_kapso_proxy() -> None:
     assert kwargs["json"]["text"]["body"] == "Hello *world* docs (https://example.com)"
 
 
+async def test_send_typing_uses_last_inbound_message_as_anchor() -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+        )
+    )
+    kapso._session = FakeSession()
+    event = kapso._message_event_from_kapso_event(
+        {
+            "event": "whatsapp.message.received",
+            "phone_number_id": "pn-123",
+            "message": {
+                "id": "wamid.in",
+                "from": "15551234567",
+                "type": "text",
+                "timestamp": "1710000000",
+                "text": {"body": "hola"},
+                "kapso": {"direction": "inbound"},
+            },
+            "conversation": {"id": "conv-1"},
+        }
+    )
+    assert event is not None
+    kapso._remember_typing_anchor(event.source.chat_id, event.message_id)
+
+    # Hermes' typing loop: no metadata for a WhatsApp DM (no thread).
+    await kapso.send_typing(event.source.chat_id, metadata=None)
+
+    assert len(kapso._session.calls) == 1
+    url, kwargs = kapso._session.calls[0]
+    assert url == "https://api.kapso.ai/meta/whatsapp/v24.0/pn-123/messages"
+    assert kwargs["headers"]["X-API-Key"] == "key"
+    assert kwargs["json"] == {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": "wamid.in",
+        "typing_indicator": {"type": "text"},
+    }
+
+
+async def test_send_typing_is_throttled_per_chat(monkeypatch) -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-default")
+    )
+    kapso._session = FakeSession()
+    kapso._remember_typing_anchor("15551234567", "wamid.in")
+    clock = [1000.0]
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: clock[0])
+
+    await kapso.send_typing("15551234567")
+    clock[0] += 5.0  # Hermes' refresh cadence
+    await kapso.send_typing("15551234567")
+    assert len(kapso._session.calls) == 1
+
+    clock[0] += adapter.TYPING_REFRESH_SECONDS
+    await kapso.send_typing("15551234567")
+    assert len(kapso._session.calls) == 2
+
+    # A different chat is not throttled by this one.
+    kapso._remember_typing_anchor("15550000000", "wamid.other")
+    await kapso.send_typing("15550000000")
+    assert len(kapso._session.calls) == 3
+
+
+async def test_send_typing_prefers_explicit_metadata_over_anchor() -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-default")
+    )
+    kapso._session = FakeSession()
+    kapso._remember_typing_anchor("15551234567", "wamid.older")
+
+    await kapso.send_typing("15551234567", metadata={"whatsapp_message_id": "wamid.explicit"})
+
+    assert kapso._session.calls[0][1]["json"]["message_id"] == "wamid.explicit"
+
+
+async def test_send_typing_without_anchor_is_a_noop() -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-default")
+    )
+    kapso._session = FakeSession()
+    # A payload without a message id gets a synthetic "kapso-<ms>" id; Meta
+    # would reject it, so it must not become an anchor.
+    kapso._remember_typing_anchor("15551234567", "kapso-1710000000000")
+
+    await kapso.send_typing("15551234567", metadata=None)
+
+    assert kapso._session.calls == []
+
+
+def test_typing_anchor_cache_is_bounded() -> None:
+    kapso = adapter.KapsoAdapter(
+        make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-default")
+    )
+    for i in range(adapter.TYPING_ANCHOR_CACHE_SIZE + 5):
+        kapso._remember_typing_anchor(f"chat-{i}", f"wamid.{i}")
+
+    assert len(kapso._typing_anchors) == adapter.TYPING_ANCHOR_CACHE_SIZE
+    assert "chat-0" not in kapso._typing_anchors
+    assert kapso._typing_anchors[f"chat-{adapter.TYPING_ANCHOR_CACHE_SIZE + 4}"] == (
+        f"wamid.{adapter.TYPING_ANCHOR_CACHE_SIZE + 4}"
+    )
+
+
 async def test_send_image_file_uploads_and_sends_media(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(adapter, "FormData", lambda: types.SimpleNamespace(add_field=lambda *_, **__: None))
     image = tmp_path / "chart.png"
