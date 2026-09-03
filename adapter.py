@@ -82,6 +82,8 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_BODY_BYTES = 1_048_576
 MAX_WHATSAPP_TEXT_LENGTH = 4096
 SEEN_MESSAGE_CACHE_SIZE = 1024
+TYPING_ANCHOR_CACHE_SIZE = 256
+TYPING_REFRESH_SECONDS = 20.0  # Meta shows the indicator for 25 s per call
 KAPSO_MESSAGE_RECEIVED_EVENT = "whatsapp.message.received"
 
 _GRAPH_VERSION_RE = re.compile(r"/v\d+\.\d+$")
@@ -247,6 +249,12 @@ class KapsoAdapter(BasePlatformAdapter):
         self._runner = None
         self._session: Optional[ClientSession] = None
         self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
+        # chat_id -> the most recent inbound WhatsApp message id. Meta's typing
+        # indicator rides the mark-as-read call and needs a concrete inbound
+        # message id; Hermes' typing loop only passes thread metadata (none for
+        # a WhatsApp DM), so the adapter remembers the anchor itself.
+        self._typing_anchors: OrderedDict[str, str] = OrderedDict()
+        self._typing_sent_at: Dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -550,11 +558,15 @@ class KapsoAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WhatsApp typing indicators require a concrete inbound message ID.
+        """Show WhatsApp's typing indicator ("typing…") for up to 25 seconds.
 
-        Hermes' generic typing loop usually only passes thread metadata, so
-        this is a best-effort no-op unless callers include a Kapso/WhatsApp
-        message ID explicitly.
+        Meta only accepts the indicator on a mark-as-read call for a concrete
+        inbound message id. Callers may pass one in ``metadata``
+        (``kapso_message_id`` / ``whatsapp_message_id`` / ``message_id``);
+        otherwise the adapter falls back to the most recent inbound message it
+        received on this chat. Hermes' typing loop passes thread metadata only,
+        and a WhatsApp DM has no thread, so the fallback is the path that runs
+        in practice. Best-effort: no anchor, no call.
         """
         if not self._session:
             return
@@ -566,6 +578,14 @@ class KapsoAdapter(BasePlatformAdapter):
                 or metadata.get("message_id")
             )
         if not message_id:
+            message_id = self._typing_anchors.get(chat_id)
+        if not message_id:
+            return
+        # Hermes refreshes typing every few seconds; Meta keeps the indicator
+        # up for 25 s per call, so one mark-read POST per ~20 s is enough.
+        now = time.monotonic()
+        last = self._typing_sent_at.get(chat_id)
+        if last is not None and now - last < TYPING_REFRESH_SECONDS:
             return
         resolved = self._resolve_chat_id(chat_id)
         if not resolved:
@@ -573,6 +593,11 @@ class KapsoAdapter(BasePlatformAdapter):
         phone_number_id, _recipient = resolved
         if not phone_number_id:
             return
+        self._typing_sent_at[chat_id] = now
+        if len(self._typing_sent_at) > TYPING_ANCHOR_CACHE_SIZE:
+            self._typing_sent_at = {
+                cid: ts for cid, ts in self._typing_sent_at.items() if now - ts < TYPING_REFRESH_SECONDS
+            }
         try:
             await _mark_read_typing(
                 session=self._session,
@@ -625,6 +650,7 @@ class KapsoAdapter(BasePlatformAdapter):
             await self._hydrate_media_event(message_event, kapso_event)
             if self._is_seen(message_event.message_id):
                 continue
+            self._remember_typing_anchor(message_event.source.chat_id, message_event.message_id)
             await self.handle_message(message_event)
             self._remember_seen(message_event.message_id)
             processed += 1
@@ -876,6 +902,17 @@ class KapsoAdapter(BasePlatformAdapter):
         if not message_id:
             return False
         return message_id in self._seen_message_ids
+
+    def _remember_typing_anchor(self, chat_id: Optional[str], message_id: Optional[str]) -> None:
+        """Keep the latest real inbound message id per chat for send_typing."""
+        if not chat_id or not message_id or message_id.startswith("kapso-"):
+            # "kapso-<ms>" is the adapter's own placeholder for a payload
+            # without an id; Meta would reject it, so it is not an anchor.
+            return
+        self._typing_anchors[chat_id] = message_id
+        self._typing_anchors.move_to_end(chat_id)
+        while len(self._typing_anchors) > TYPING_ANCHOR_CACHE_SIZE:
+            self._typing_anchors.popitem(last=False)
 
     def _remember_seen(self, message_id: Optional[str]) -> None:
         if not message_id:
