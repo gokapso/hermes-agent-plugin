@@ -1018,3 +1018,50 @@ def test_register_supplies_platform_hooks() -> None:
     assert ctx.kwargs["max_message_length"] == adapter.MAX_WHATSAPP_TEXT_LENGTH
     assert ctx.cli_kwargs["name"] == "kapso"
     assert callable(ctx.cli_kwargs["setup_fn"])
+
+
+def test_business_scoped_user_id_is_used_when_phone_is_absent() -> None:
+    """WhatsApp can deliver identity without a phone number (usernames)."""
+    kapso = adapter.KapsoAdapter(
+        make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-default")
+    )
+    event = {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.2",
+            "type": "text",
+            "timestamp": "1710000000",
+            "text": {"body": "hola"},
+            "kapso": {"direction": "inbound", "contactName": "Juan"},
+        },
+        "conversation": {
+            "id": "conv-2",
+            "phone_number": None,
+            "business_scoped_user_id": "CO.1046632291676528",
+            "username": "jdramirezv",
+        },
+    }
+
+    message_event = kapso._message_event_from_kapso_event(event)
+
+    assert message_event is not None
+    assert message_event.source.user_id == "CO.1046632291676528"
+    assert message_event.source.chat_id.startswith("kapso:")
+
+
+def test_business_scoped_user_id_survives_the_chat_id_round_trip() -> None:
+    """_normalize_phone strips dots, which would corrupt a business-scoped ID."""
+    bsuid = "CO.1046632291676528"
+    chat_id = adapter.encode_kapso_chat_id("pn-123", bsuid, "conv-2")
+
+    resolved = adapter._resolve_chat_id_static(chat_id, "pn-default")
+
+    assert resolved == ("pn-123", bsuid)
+
+
+def test_send_payload_picks_to_or_recipient_by_identity_kind() -> None:
+    assert adapter._recipient_field("15551234567") == {"to": "15551234567"}
+    assert adapter._recipient_field("CO.1046632291676528") == {
+        "recipient": "CO.1046632291676528"
+    }
