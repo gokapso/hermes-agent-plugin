@@ -650,10 +650,19 @@ class KapsoAdapter(BasePlatformAdapter):
             or _read_str(kapso, "phoneNumberId", "phone_number_id")
             or self.default_phone_number_id
         )
+        contact = _record(message.get("contact")) or _record(event.get("contact")) or {}
         wa_id = (
             _read_str(message, "from")
             or _normalize_phone(_read_str(conversation, "phone_number", "phoneNumber"))
             or _read_str(message, "to")
+            # WhatsApp can send identity without a phone number; Kapso then supplies
+            # a business-scoped user ID instead. See docs/whatsapp/business-scoped-user-ids.
+            or _read_str(message, "business_scoped_user_id", "businessScopedUserId")
+            or _read_str(conversation, "business_scoped_user_id", "businessScopedUserId")
+            or _read_str(contact, "business_scoped_user_id", "businessScopedUserId")
+            or _read_str(kapso, "business_scoped_user_id", "businessScopedUserId")
+            or _read_str(message, "parent_business_scoped_user_id", "parentBusinessScopedUserId")
+            or _read_str(conversation, "parent_business_scoped_user_id", "parentBusinessScopedUserId")
         )
         if not phone_number_id or not wa_id:
             logger.warning("[kapso] skipping webhook message without phone_number_id or participant")
@@ -860,16 +869,16 @@ class KapsoAdapter(BasePlatformAdapter):
             recipient = _decode_part(parts[2])
             if not phone_number_id or not recipient:
                 return None
-            return phone_number_id, _normalize_phone(recipient) or recipient
+            return phone_number_id, _clean_recipient(recipient) or recipient
 
         if ":" in value:
             phone_number_id, recipient = value.split(":", 1)
             phone_number_id = phone_number_id.strip()
-            recipient = _normalize_phone(recipient) or recipient.strip()
+            recipient = _clean_recipient(recipient) or recipient.strip()
             if phone_number_id and recipient:
                 return phone_number_id, recipient
 
-        recipient = _normalize_phone(value) or value
+        recipient = _clean_recipient(value) or value
         return self.default_phone_number_id, recipient
 
     def _is_seen(self, message_id: Optional[str]) -> bool:
@@ -1711,14 +1720,14 @@ def _resolve_chat_id_static(
         recipient = _decode_part(parts[2])
         if not phone_number_id or not recipient:
             return None
-        return phone_number_id, _normalize_phone(recipient) or recipient
+        return phone_number_id, _clean_recipient(recipient) or recipient
     if ":" in value:
         phone_number_id, recipient = value.split(":", 1)
         phone_number_id = phone_number_id.strip()
-        recipient = _normalize_phone(recipient) or recipient.strip()
+        recipient = _clean_recipient(recipient) or recipient.strip()
         if phone_number_id and recipient:
             return phone_number_id, recipient
-    recipient = _normalize_phone(value) or value
+    recipient = _clean_recipient(value) or value
     return default_phone_number_id, recipient
 
 
@@ -1735,7 +1744,7 @@ async def _send_text_via_kapso(
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": recipient,
+        **_recipient_field(recipient),
         "type": "text",
         "text": {"body": body, "preview_url": True},
     }
@@ -1833,7 +1842,7 @@ async def _send_media_file_via_kapso(
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": recipient,
+        **_recipient_field(recipient),
         "type": media["kind"],
         media["kind"]: media_payload,
     }
@@ -2364,6 +2373,38 @@ def _normalize_phone(value: Optional[str]) -> Optional[str]:
         return None
     cleaned = re.sub(r"[\s().-]+", "", value.strip())
     return cleaned or None
+
+
+_PHONE_RE = re.compile(r"\+?\d[\d\s().-]*$")
+
+
+def _is_opaque_recipient(value: Optional[str]) -> bool:
+    """True for identities that are not phone numbers.
+
+    Meta can now deliver a business-scoped user ID (e.g. "CO.1046632291676528")
+    instead of a wa_id. Those must never be run through _normalize_phone, which
+    strips dots and would corrupt them.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return not _PHONE_RE.match(text)
+
+
+def _clean_recipient(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if _is_opaque_recipient(text):
+        return text
+    return _normalize_phone(text) or text
+
+
+def _recipient_field(recipient: str) -> Dict[str, str]:
+    """Kapso's send API takes either `to` (phone) or `recipient` (business-scoped ID)."""
+    if _is_opaque_recipient(recipient):
+        return {"recipient": recipient}
+    return {"to": recipient}
 
 
 def _encode_part(value: str) -> str:
