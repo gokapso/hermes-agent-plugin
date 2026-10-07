@@ -73,6 +73,29 @@ except ImportError:  # pragma: no cover - only used outside newer Hermes runtime
 
 logger = logging.getLogger(__name__)
 
+try:  # multiplex-safe credential read (hermes #86905 family)
+    from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
+except Exception:  # pragma: no cover - older runtimes / standalone installs
+    _get_scoped_secret = None
+
+
+def _env(name: str, default: Any = None) -> Any:
+    """Read an env var through the ACTIVE profile's secret scope.
+
+    Under a multiplexed gateway ``os.environ`` holds the LAUNCH (default) profile's
+    values — a secondary profile's ``.env`` lives only in its secret scope. A bare
+    ``os.getenv`` therefore makes this adapter look unconfigured for every secondary
+    profile, and ``_env_enablement()`` silently returns None so no adapter is built.
+    ``get_scoped_secret`` resolves the owning profile's ``.env`` and still falls back to
+    ``os.environ`` for single-profile installs (where it IS the profile's own value).
+    """
+    if _get_scoped_secret is not None:
+        value = _get_scoped_secret(name, None)
+    else:
+        value = os.getenv(name)
+    return default if value is None else value
+
+
 DEFAULT_BASE_URL = "https://api.kapso.ai/meta/whatsapp"
 DEFAULT_GRAPH_VERSION = "v24.0"
 DEFAULT_HOST = "0.0.0.0"
@@ -183,14 +206,14 @@ class KapsoAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
 
         self.api_key = _first_nonempty(
-            os.getenv("KAPSO_API_KEY"),
+            _env("KAPSO_API_KEY"),
             getattr(config, "api_key", None),
             extra.get("api_key"),
             extra.get("kapso_api_key"),
         )
         self.base_url = _normalize_base_url(
             _first_nonempty(
-                os.getenv("KAPSO_BASE_URL"),
+                _env("KAPSO_BASE_URL"),
                 extra.get("base_url"),
                 extra.get("api_base_url"),
                 DEFAULT_BASE_URL,
@@ -198,49 +221,49 @@ class KapsoAdapter(BasePlatformAdapter):
         )
         self.graph_version = _strip_slashes(
             _first_nonempty(
-                os.getenv("KAPSO_GRAPH_VERSION"),
-                os.getenv("META_GRAPH_VERSION"),
+                _env("KAPSO_GRAPH_VERSION"),
+                _env("META_GRAPH_VERSION"),
                 extra.get("graph_version"),
                 DEFAULT_GRAPH_VERSION,
             )
         )
         self.default_phone_number_id = _first_nonempty(
-            os.getenv("KAPSO_PHONE_NUMBER_ID"),
-            os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
+            _env("KAPSO_PHONE_NUMBER_ID"),
+            _env("WHATSAPP_PHONE_NUMBER_ID"),
             extra.get("phone_number_id"),
         )
         self.webhook_secret = _first_nonempty(
-            os.getenv("KAPSO_WEBHOOK_SECRET"),
+            _env("KAPSO_WEBHOOK_SECRET"),
             extra.get("webhook_secret"),
         )
         self.verify_webhook_signatures = _coerce_bool(
             _first_defined(
-                os.getenv("KAPSO_VERIFY_WEBHOOK_SIGNATURES"),
+                _env("KAPSO_VERIFY_WEBHOOK_SIGNATURES"),
                 extra.get("verify_webhook_signatures"),
             ),
             default=True,
         )
-        self.host = _first_nonempty(os.getenv("KAPSO_HOST"), extra.get("host"), DEFAULT_HOST)
+        self.host = _first_nonempty(_env("KAPSO_HOST"), extra.get("host"), DEFAULT_HOST)
         self.port = _coerce_int(
-            _first_nonempty(os.getenv("KAPSO_PORT"), extra.get("port")),
+            _first_nonempty(_env("KAPSO_PORT"), extra.get("port")),
             DEFAULT_PORT,
         )
         self.webhook_path = _normalize_path(
             _first_nonempty(
-                os.getenv("KAPSO_WEBHOOK_PATH"),
+                _env("KAPSO_WEBHOOK_PATH"),
                 extra.get("webhook_path"),
                 DEFAULT_WEBHOOK_PATH,
             )
         )
         self.request_timeout_seconds = _coerce_float(
             _first_nonempty(
-                os.getenv("KAPSO_REQUEST_TIMEOUT_SECONDS"),
+                _env("KAPSO_REQUEST_TIMEOUT_SECONDS"),
                 extra.get("request_timeout_seconds"),
             ),
             DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         self.max_body_bytes = _coerce_int(
-            _first_nonempty(os.getenv("KAPSO_MAX_BODY_BYTES"), extra.get("max_body_bytes")),
+            _first_nonempty(_env("KAPSO_MAX_BODY_BYTES"), extra.get("max_body_bytes")),
             DEFAULT_MAX_BODY_BYTES,
         )
 
@@ -895,19 +918,19 @@ def validate_config(config) -> bool:
     """Validate credentials and webhook security settings."""
     extra = getattr(config, "extra", {}) or {}
     api_key = _first_nonempty(
-        os.getenv("KAPSO_API_KEY"),
+        _env("KAPSO_API_KEY"),
         getattr(config, "api_key", None),
         extra.get("api_key"),
         extra.get("kapso_api_key"),
     )
     verify = _coerce_bool(
         _first_defined(
-            os.getenv("KAPSO_VERIFY_WEBHOOK_SIGNATURES"),
+            _env("KAPSO_VERIFY_WEBHOOK_SIGNATURES"),
             extra.get("verify_webhook_signatures"),
         ),
         default=True,
     )
-    secret = _first_nonempty(os.getenv("KAPSO_WEBHOOK_SECRET"), extra.get("webhook_secret"))
+    secret = _first_nonempty(_env("KAPSO_WEBHOOK_SECRET"), extra.get("webhook_secret"))
     return bool(api_key and (secret or not verify))
 
 
@@ -917,11 +940,11 @@ def is_connected(config) -> bool:
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
-    api_key = os.getenv("KAPSO_API_KEY", "").strip()
+    api_key = _env("KAPSO_API_KEY", "").strip()
     if not api_key:
         return None
-    verify = _coerce_bool(os.getenv("KAPSO_VERIFY_WEBHOOK_SIGNATURES"), default=True)
-    webhook_secret = os.getenv("KAPSO_WEBHOOK_SECRET", "").strip()
+    verify = _coerce_bool(_env("KAPSO_VERIFY_WEBHOOK_SIGNATURES"), default=True)
+    webhook_secret = _env("KAPSO_WEBHOOK_SECRET", "").strip()
     if verify and not webhook_secret:
         return None
 
@@ -933,13 +956,13 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     _seed_env(seed, "host", "KAPSO_HOST")
     _seed_int_env(seed, "port", "KAPSO_PORT")
     _seed_env(seed, "webhook_path", "KAPSO_WEBHOOK_PATH")
-    if os.getenv("KAPSO_VERIFY_WEBHOOK_SIGNATURES") is not None:
+    if _env("KAPSO_VERIFY_WEBHOOK_SIGNATURES") is not None:
         seed["verify_webhook_signatures"] = verify
-    home = os.getenv("KAPSO_HOME_CHANNEL", "").strip()
+    home = _env("KAPSO_HOME_CHANNEL", "").strip()
     if home:
         seed["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("KAPSO_HOME_CHANNEL_NAME", home),
+            "name": _env("KAPSO_HOME_CHANNEL_NAME", home),
         }
     return seed
 
@@ -983,7 +1006,7 @@ async def _standalone_send(
         return {"error": "Kapso standalone send: aiohttp is not installed"}
     extra = getattr(pconfig, "extra", {}) or {}
     api_key = _first_nonempty(
-        os.getenv("KAPSO_API_KEY"),
+        _env("KAPSO_API_KEY"),
         getattr(pconfig, "api_key", None),
         extra.get("api_key"),
         extra.get("kapso_api_key"),
@@ -992,19 +1015,19 @@ async def _standalone_send(
         return {"error": "Kapso standalone send: KAPSO_API_KEY is required"}
 
     base_url = _normalize_base_url(
-        _first_nonempty(os.getenv("KAPSO_BASE_URL"), extra.get("base_url"), DEFAULT_BASE_URL)
+        _first_nonempty(_env("KAPSO_BASE_URL"), extra.get("base_url"), DEFAULT_BASE_URL)
     )
     graph_version = _strip_slashes(
         _first_nonempty(
-            os.getenv("KAPSO_GRAPH_VERSION"),
-            os.getenv("META_GRAPH_VERSION"),
+            _env("KAPSO_GRAPH_VERSION"),
+            _env("META_GRAPH_VERSION"),
             extra.get("graph_version"),
             DEFAULT_GRAPH_VERSION,
         )
     )
     default_phone_number_id = _first_nonempty(
-        os.getenv("KAPSO_PHONE_NUMBER_ID"),
-        os.getenv("WHATSAPP_PHONE_NUMBER_ID"),
+        _env("KAPSO_PHONE_NUMBER_ID"),
+        _env("WHATSAPP_PHONE_NUMBER_ID"),
         extra.get("phone_number_id"),
     )
     resolved = _resolve_chat_id_static(chat_id, default_phone_number_id)
@@ -2437,14 +2460,14 @@ def _normalize_path(value: str) -> str:
 
 def _seed_env(seed: Dict[str, Any], key: str, *env_names: str) -> None:
     for env_name in env_names:
-        value = os.getenv(env_name, "").strip()
+        value = _env(env_name, "").strip()
         if value:
             seed[key] = value
             return
 
 
 def _seed_int_env(seed: Dict[str, Any], key: str, env_name: str) -> None:
-    value = os.getenv(env_name, "").strip()
+    value = _env(env_name, "").strip()
     if not value:
         return
     try:

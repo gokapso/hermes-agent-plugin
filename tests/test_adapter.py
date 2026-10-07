@@ -1018,3 +1018,68 @@ def test_register_supplies_platform_hooks() -> None:
     assert ctx.kwargs["max_message_length"] == adapter.MAX_WHATSAPP_TEXT_LENGTH
     assert ctx.cli_kwargs["name"] == "kapso"
     assert callable(ctx.cli_kwargs["setup_fn"])
+
+
+# --- scope-aware credential reads (multiplexed gateway) -----------------------
+
+
+def _scoped(values):
+    """Fake ``gateway.platforms._shared.get_scoped_secret`` with a fixed mapping."""
+
+    def read(name, default=None):
+        return values.get(name, default)
+
+    return read
+
+
+def test_env_reads_through_scoped_secret(monkeypatch) -> None:
+    """A multiplexed gateway keeps a secondary profile's .env in its secret scope, so a
+    bare os.getenv would only ever see the launch (default) profile's value."""
+    monkeypatch.setattr(adapter, "_get_scoped_secret", _scoped({"KAPSO_API_KEY": "scoped-key"}))
+    monkeypatch.delenv("KAPSO_API_KEY", raising=False)
+
+    assert adapter._env("KAPSO_API_KEY") == "scoped-key"
+
+
+def test_env_falls_back_to_os_environ_without_scoped_reader(monkeypatch) -> None:
+    """Single-profile installs (no scope helper importable) keep reading os.environ."""
+    monkeypatch.setattr(adapter, "_get_scoped_secret", None)
+    monkeypatch.setenv("KAPSO_API_KEY", "from-environ")
+
+    assert adapter._env("KAPSO_API_KEY") == "from-environ"
+    assert adapter._env("KAPSO_ABSENT", "fallback") == "fallback"
+
+
+def test_env_enablement_is_scope_aware(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter,
+        "_get_scoped_secret",
+        _scoped(
+            {
+                "KAPSO_API_KEY": "scoped-key",
+                "KAPSO_WEBHOOK_SECRET": "scoped-secret",
+                "KAPSO_PHONE_NUMBER_ID": "pn-scoped",
+            }
+        ),
+    )
+    monkeypatch.delenv("KAPSO_API_KEY", raising=False)
+    monkeypatch.delenv("KAPSO_WEBHOOK_SECRET", raising=False)
+
+    seed = adapter._env_enablement()
+
+    assert seed is not None
+    assert seed["api_key"] == "scoped-key"
+    assert seed["webhook_secret"] == "scoped-secret"
+    assert seed["phone_number_id"] == "pn-scoped"
+
+
+def test_validate_config_is_scope_aware(monkeypatch) -> None:
+    monkeypatch.setattr(
+        adapter,
+        "_get_scoped_secret",
+        _scoped({"KAPSO_API_KEY": "scoped-key", "KAPSO_WEBHOOK_SECRET": "scoped-secret"}),
+    )
+    monkeypatch.delenv("KAPSO_API_KEY", raising=False)
+    monkeypatch.delenv("KAPSO_WEBHOOK_SECRET", raising=False)
+
+    assert adapter.validate_config(make_config()) is True
