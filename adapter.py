@@ -80,6 +80,8 @@ DEFAULT_PORT = 8648
 DEFAULT_WEBHOOK_PATH = "/kapso/webhook"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_BODY_BYTES = 1_048_576
+DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+MEDIA_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_WHATSAPP_TEXT_LENGTH = 4096
 SEEN_MESSAGE_CACHE_SIZE = 1024
 KAPSO_MESSAGE_RECEIVED_EVENT = "whatsapp.message.received"
@@ -242,6 +244,10 @@ class KapsoAdapter(BasePlatformAdapter):
         self.max_body_bytes = _coerce_int(
             _first_nonempty(os.getenv("KAPSO_MAX_BODY_BYTES"), extra.get("max_body_bytes")),
             DEFAULT_MAX_BODY_BYTES,
+        )
+        self.max_media_bytes = _coerce_int(
+            _first_nonempty(os.getenv("KAPSO_MAX_MEDIA_BYTES"), extra.get("max_media_bytes")),
+            DEFAULT_MAX_MEDIA_BYTES,
         )
 
         self._runner = None
@@ -692,6 +698,80 @@ class KapsoAdapter(BasePlatformAdapter):
             timestamp=_message_timestamp(message),
         )
 
+    def _sender_may_receive_media(self, event: MessageEvent) -> bool:
+        """Whether inbound media from this sender may be downloaded at all.
+
+        Hermes core runs its allowlist check inside handle_message(), which the
+        webhook handler reaches only after media hydration, so without this gate
+        any WhatsApp user could make the host download and cache their files by
+        messaging the number. Mirror the authorization core will apply: everyone
+        when KAPSO_ALLOW_ALL_USERS is on, otherwise only the wa_ids listed in
+        KAPSO_ALLOWED_USERS. With no allowlist configured there is no list to
+        authorize against (core falls back to pairing), and hydration keeps its
+        previous behavior; the size cap in _read_media_body still applies.
+        """
+        if _coerce_bool(os.getenv("KAPSO_ALLOW_ALL_USERS"), default=False):
+            return True
+        allowed = set()
+        for entry in os.getenv("KAPSO_ALLOWED_USERS", "").split(","):
+            digits = re.sub(r"\D", "", entry)
+            if digits:
+                allowed.add(digits)
+        if not allowed:
+            return True
+        sender = re.sub(r"\D", "", getattr(event.source, "user_id", None) or "")
+        return bool(sender) and sender in allowed
+
+    async def _read_media_body(
+        self, response, kind: str, message_id: Optional[str]
+    ) -> Optional[bytes]:
+        """Read an inbound media body under the KAPSO_MAX_MEDIA_BYTES cap.
+
+        Checks the declared Content-Length when present, then streams with a
+        running total so an oversized or misdeclared response is aborted
+        instead of being buffered whole in memory and written to the cache.
+        Returns None when the cap is exceeded.
+        """
+        limit = self.max_media_bytes
+        declared = getattr(response, "content_length", None)
+        if isinstance(declared, int) and declared > limit:
+            logger.warning(
+                "[kapso] %s media %s declares %d bytes over the %d byte cap; skipping download",
+                kind,
+                message_id,
+                declared,
+                limit,
+            )
+            return None
+        content = getattr(response, "content", None)
+        iter_chunked = getattr(content, "iter_chunked", None)
+        if callable(iter_chunked):
+            chunks = []
+            total = 0
+            async for chunk in iter_chunked(MEDIA_DOWNLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > limit:
+                    logger.warning(
+                        "[kapso] %s media %s exceeded the %d byte cap; aborting download",
+                        kind,
+                        message_id,
+                        limit,
+                    )
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+        data = await response.read()
+        if len(data) > limit:
+            logger.warning(
+                "[kapso] %s media %s is %d bytes over the %d byte cap; discarding",
+                kind,
+                message_id,
+                len(data),
+                limit,
+            )
+            return None
+        return data
+
     async def _hydrate_media_event(self, event: MessageEvent, kapso_event: Dict[str, Any]) -> None:
         """Download inbound media into Hermes' local caches for vision/STT/document tools."""
         if event.message_type not in {
@@ -704,6 +784,12 @@ class KapsoAdapter(BasePlatformAdapter):
         if getattr(event, "media_urls", None):
             return
         if not self._session:
+            return
+        if not self._sender_may_receive_media(event):
+            logger.info(
+                "[kapso] skipping media hydration for unauthorized sender (message %s)",
+                event.message_id,
+            )
             return
 
         message = _record(kapso_event.get("message"))
@@ -749,7 +835,9 @@ class KapsoAdapter(BasePlatformAdapter):
                         _compact(text),
                     )
                     return
-                data = await response.read()
+                data = await self._read_media_body(response, kind, event.message_id)
+                if data is None:
+                    return
                 content_type = response.headers.get("Content-Type", "")
         except Exception as exc:
             logger.warning("[kapso] failed to download %s media %s: %s", kind, event.message_id, exc)
