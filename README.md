@@ -138,6 +138,15 @@ hermes kapso setup --allowed-users 15551234567 --no-prompt
 hermes gateway restart
 ```
 
+When `KAPSO_ALLOWED_USERS` is set, unknown senders are ignored rather than sent a
+Hermes pairing code. An explicit `unauthorized_dm_behavior` or `dm_policy` in your
+Hermes config still takes precedence. This needs Hermes v2026.7.1 or newer; on older
+versions, set `unauthorized_dm_behavior: ignore` for the same effect.
+
+Pairings approved earlier keep access. After upgrading, review them with
+`hermes pairing list`, remove unwanted ones with `hermes pairing revoke kapso <id>`,
+and discard outstanding codes with `hermes pairing clear-pending`.
+
 For development-only open access:
 
 ```bash

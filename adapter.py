@@ -71,6 +71,11 @@ try:
 except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
     _hermes_supported_document_types = {}
 
+try:
+    from gateway.platforms._shared import platform_gate_env as _hermes_gate_env
+except ImportError:  # pragma: no cover - only used outside newer Hermes runtimes
+    _hermes_gate_env = None
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.kapso.ai/meta/whatsapp"
@@ -83,6 +88,8 @@ DEFAULT_MAX_BODY_BYTES = 1_048_576
 MAX_WHATSAPP_TEXT_LENGTH = 4096
 SEEN_MESSAGE_CACHE_SIZE = 1024
 KAPSO_MESSAGE_RECEIVED_EVENT = "whatsapp.message.received"
+# DM policies Hermes core applies to unauthorized DMs; any other value falls through to pairing.
+_HERMES_DM_POLICIES = frozenset({"pairing", "allowlist", "disabled"})
 
 _GRAPH_VERSION_RE = re.compile(r"/v\d+\.\d+$")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
@@ -213,6 +220,12 @@ class KapsoAdapter(BasePlatformAdapter):
             os.getenv("KAPSO_WEBHOOK_SECRET"),
             extra.get("webhook_secret"),
         )
+        # Hermes core answers unauthorized DMs with a pairing code unless the adapter reports an
+        # allowlist DM policy; approving that code grants access outside KAPSO_ALLOWED_USERS (#4).
+        # A dm_policy core acts on in the platform config is the operator's choice; leave it to core.
+        configured_policy = str(extra.get("dm_policy") or "").strip().lower()
+        if configured_policy not in _HERMES_DM_POLICIES and _kapso_allowlist_env():
+            self._dm_policy = "allowlist"
         self.verify_webhook_signatures = _coerce_bool(
             _first_defined(
                 os.getenv("KAPSO_VERIFY_WEBHOOK_SIGNATURES"),
@@ -884,6 +897,25 @@ class KapsoAdapter(BasePlatformAdapter):
         self._seen_message_ids.move_to_end(message_id)
         while len(self._seen_message_ids) > SEEN_MESSAGE_CACHE_SIZE:
             self._seen_message_ids.popitem(last=False)
+
+
+def _kapso_allowlist_env() -> str:
+    """Return KAPSO_ALLOWED_USERS as Hermes core's authorization gate sees it.
+
+    Secondary profiles under ``multiplex_profiles`` keep their ``.env`` in a secret scope rather than
+    ``os.environ``, so the allowlist is read the way core reads it: through ``platform_gate_env``
+    where available, otherwise the profile scope and then ``os.environ``. On older runtimes this
+    may see an allowlist core does not, which errs toward ignoring strangers rather than pairing.
+    """
+    if _hermes_gate_env is not None:
+        return _hermes_gate_env("KAPSO_ALLOWED_USERS")
+    try:
+        from agent.secret_scope import get_secret
+
+        scoped = str(get_secret("KAPSO_ALLOWED_USERS") or "").strip()
+    except (ImportError, RuntimeError):  # no secret scopes yet, or UnscopedSecretError
+        scoped = ""
+    return scoped or (os.getenv("KAPSO_ALLOWED_USERS") or "").strip()
 
 
 def check_requirements() -> bool:

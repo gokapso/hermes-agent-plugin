@@ -10,6 +10,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -154,6 +156,131 @@ async def test_connect_accepts_hermes_reconnect_keyword(monkeypatch) -> None:
 
     assert connected is False
     assert kapso.fatal == ("missing_dependency", "aiohttp is not installed", False)
+
+
+@pytest.mark.parametrize("allowed", ["15551234567", "15551234567,15557654321", "  15551234567  "])
+def test_allowlist_sets_allowlist_dm_policy(monkeypatch, allowed) -> None:
+    # Hermes core answers unauthorized DMs with "ignore" instead of a pairing code for this policy.
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", allowed)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert getattr(kapso, "_dm_policy", None) == "allowlist"
+
+
+@pytest.mark.parametrize("allowed", [None, "", "   "])
+def test_no_allowlist_keeps_hermes_default_dm_policy(monkeypatch, allowed) -> None:
+    # Without an allowlist the adapter sets no policy, so Hermes keeps its pairing flow.
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    if allowed is None:
+        monkeypatch.delenv("KAPSO_ALLOWED_USERS", raising=False)
+    else:
+        monkeypatch.setenv("KAPSO_ALLOWED_USERS", allowed)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert not hasattr(kapso, "_dm_policy")
+
+
+def test_allowlist_is_read_through_hermes_gate_for_secondary_profiles(monkeypatch) -> None:
+    # A multiplexed secondary profile's .env lives in a secret scope, not os.environ.
+    monkeypatch.delenv("KAPSO_ALLOWED_USERS", raising=False)
+    reads = []
+
+    def gate(name, default=""):
+        reads.append(name)
+        return "15551234567"
+
+    monkeypatch.setattr(adapter, "_hermes_gate_env", gate, raising=False)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert getattr(kapso, "_dm_policy", None) == "allowlist"
+    assert reads == ["KAPSO_ALLOWED_USERS"]
+
+
+def test_hermes_gate_without_allowlist_overrides_process_env(monkeypatch) -> None:
+    # The launch profile's os.environ allowlist must not suppress pairing for a secondary profile
+    # whose own scope has no allowlist; core authorizes that profile without one.
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr(adapter, "_hermes_gate_env", lambda name, default="": "", raising=False)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert not hasattr(kapso, "_dm_policy")
+
+
+@pytest.mark.parametrize("configured", ["pairing", "allowlist", "disabled", " Pairing "])
+def test_explicit_config_dm_policy_is_left_to_hermes(monkeypatch, configured) -> None:
+    # Hermes prefers the adapter's _dm_policy over platforms.kapso.extra.dm_policy, so setting it
+    # here would override an operator who explicitly chose a policy (e.g. pairing).
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15551234567")
+
+    kapso = adapter.KapsoAdapter(make_config(dm_policy=configured))
+
+    assert not hasattr(kapso, "_dm_policy")
+
+
+@pytest.mark.parametrize("configured", ["open", "unknown"])
+def test_config_dm_policy_hermes_ignores_does_not_disable_protection(monkeypatch, configured) -> None:
+    # Hermes only applies pairing/allowlist/disabled; any other value falls through to pairing.
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15551234567")
+
+    kapso = adapter.KapsoAdapter(make_config(dm_policy=configured))
+
+    assert getattr(kapso, "_dm_policy", None) == "allowlist"
+
+
+def test_allowlist_falls_back_to_secret_scope_on_older_hermes(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    monkeypatch.delenv("KAPSO_ALLOWED_USERS", raising=False)
+    secret_scope = types.ModuleType("agent.secret_scope")
+    secret_scope.get_secret = lambda name, default=None: "15551234567"
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert getattr(kapso, "_dm_policy", None) == "allowlist"
+
+
+def test_allowlist_uses_process_env_when_secret_scope_read_fails(monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "_hermes_gate_env", None, raising=False)
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15551234567")
+    secret_scope = types.ModuleType("agent.secret_scope")
+
+    def unscoped(name, default=None):
+        raise RuntimeError("no secret scope bound")
+
+    secret_scope.get_secret = unscoped
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+
+    kapso = adapter.KapsoAdapter(make_config())
+
+    assert getattr(kapso, "_dm_policy", None) == "allowlist"
+
+
+def test_register_does_not_require_newer_platform_entry_fields() -> None:
+    # Hermes rejects unknown register_platform kwargs with TypeError, and
+    # allowlist_suppresses_pairing only exists from Hermes v0.22.3.
+    class Ctx:
+        kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+        def register_cli_command(self, **kwargs):
+            pass
+
+    ctx = Ctx()
+    adapter.register(ctx)
+
+    assert ctx.kwargs["allowed_users_env"] == "KAPSO_ALLOWED_USERS"
+    assert "allowlist_suppresses_pairing" not in ctx.kwargs
 
 
 def test_kapso_webhook_event_becomes_message_event() -> None:
