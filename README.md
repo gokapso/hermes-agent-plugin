@@ -128,8 +128,14 @@ KAPSO_WEBHOOK_SECRET=...
 KAPSO_PHONE_NUMBER_ID=...      # recommended for outbound and cron delivery
 KAPSO_HOME_CHANNEL=15551234567 # optional default recipient for deliver=kapso
 KAPSO_ALLOWED_USERS=15551234567 # recommended for production allowlisting
+KAPSO_MAX_MEDIA_BYTES=26214400 # optional inbound media download cap (default 25 MiB)
 KAPSO_WEBHOOK_URL=https://...  # status/debug only
 ```
+
+Inbound media is downloaded only for senders the gateway would authorize
+(everyone when `KAPSO_ALLOW_ALL_USERS` is on, otherwise the
+`KAPSO_ALLOWED_USERS` list), and each download is capped at
+`KAPSO_MAX_MEDIA_BYTES`.
 
 To allow a specific WhatsApp user later:
 

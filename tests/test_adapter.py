@@ -1018,3 +1018,192 @@ def test_register_supplies_platform_hooks() -> None:
     assert ctx.kwargs["max_message_length"] == adapter.MAX_WHATSAPP_TEXT_LENGTH
     assert ctx.cli_kwargs["name"] == "kapso"
     assert callable(ctx.cli_kwargs["setup_fn"])
+
+
+class FakeStreamContent:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def iter_chunked(self, size):
+        async def generate():
+            for chunk in self._chunks:
+                yield chunk
+
+        return generate()
+
+
+class FakeStreamedGetResponse(FakeGetResponse):
+    def __init__(self, *, chunks=(), content_length=None, **kwargs):
+        super().__init__(**kwargs)
+        self.content = FakeStreamContent(chunks)
+        self.content_length = content_length
+
+
+def _image_payload(sender: str = "15551234567") -> dict:
+    return {
+        "event": "whatsapp.message.received",
+        "phone_number_id": "pn-123",
+        "message": {
+            "id": "wamid.image",
+            "from": sender,
+            "type": "image",
+            "image": {"id": "media-123", "mime_type": "image/png"},
+        },
+    }
+
+
+def _make_media_adapter(monkeypatch, *, max_media_bytes=None, media_response=None):
+    cached: list[bytes] = []
+
+    def fake_cache(data: bytes, ext: str) -> str:
+        cached.append(data)
+        return f"/tmp/hermes-image{ext}"
+
+    monkeypatch.setattr(adapter, "_cache_image_bytes", fake_cache)
+    extra: dict = {}
+    if max_media_bytes is not None:
+        extra["max_media_bytes"] = max_media_bytes
+    kapso = adapter.KapsoAdapter(
+        make_config(
+            api_key="key",
+            webhook_secret="secret",
+            phone_number_id="pn-default",
+            **extra,
+        )
+    )
+    kapso._session = FakeMediaSession(
+        [
+            FakeGetResponse(
+                text=(
+                    '{"download_url":"https://api.kapso.ai/meta/whatsapp/media_download?token=t",'
+                    '"mime_type":"image/png"}'
+                )
+            ),
+            media_response
+            or FakeGetResponse(
+                body=b"\x89PNG\r\n\x1a\npayload",
+                headers={"Content-Type": "image/png"},
+            ),
+        ]
+    )
+    return kapso, cached
+
+
+async def test_skips_media_hydration_for_sender_outside_allowlist(monkeypatch) -> None:
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15550000000")
+    monkeypatch.delenv("KAPSO_ALLOW_ALL_USERS", raising=False)
+    kapso, cached = _make_media_adapter(monkeypatch)
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert getattr(message_event, "media_urls", None) is None
+    assert kapso._session.calls == []
+    assert cached == []
+
+
+async def test_hydrates_media_for_allowlisted_sender_with_formatted_entry(monkeypatch) -> None:
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "+1 (555) 123-4567")
+    monkeypatch.delenv("KAPSO_ALLOW_ALL_USERS", raising=False)
+    kapso, cached = _make_media_adapter(monkeypatch)
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.media_urls == ["/tmp/hermes-image.png"]
+    assert cached == [b"\x89PNG\r\n\x1a\npayload"]
+
+
+async def test_allow_all_users_hydrates_any_sender(monkeypatch) -> None:
+    monkeypatch.setenv("KAPSO_ALLOWED_USERS", "15550000000")
+    monkeypatch.setenv("KAPSO_ALLOW_ALL_USERS", "true")
+    kapso, _cached = _make_media_adapter(monkeypatch)
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.media_urls == ["/tmp/hermes-image.png"]
+
+
+async def test_skips_media_declared_over_size_cap(monkeypatch) -> None:
+    kapso, cached = _make_media_adapter(
+        monkeypatch,
+        max_media_bytes=8,
+        media_response=FakeStreamedGetResponse(
+            chunks=[b"123456789"],
+            content_length=9,
+            headers={"Content-Type": "image/png"},
+        ),
+    )
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert getattr(message_event, "media_urls", None) is None
+    assert cached == []
+
+
+async def test_aborts_media_stream_that_exceeds_size_cap(monkeypatch) -> None:
+    kapso, cached = _make_media_adapter(
+        monkeypatch,
+        max_media_bytes=8,
+        media_response=FakeStreamedGetResponse(
+            chunks=[b"12345", b"67890"],
+            headers={"Content-Type": "image/png"},
+        ),
+    )
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert getattr(message_event, "media_urls", None) is None
+    assert cached == []
+
+
+async def test_discards_media_body_over_size_cap_without_streaming(monkeypatch) -> None:
+    kapso, cached = _make_media_adapter(
+        monkeypatch,
+        max_media_bytes=8,
+        media_response=FakeGetResponse(
+            body=b"123456789",
+            headers={"Content-Type": "image/png"},
+        ),
+    )
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert getattr(message_event, "media_urls", None) is None
+    assert cached == []
+
+
+async def test_hydrates_streamed_media_under_size_cap(monkeypatch) -> None:
+    kapso, cached = _make_media_adapter(
+        monkeypatch,
+        max_media_bytes=64,
+        media_response=FakeStreamedGetResponse(
+            chunks=[b"\x89PNG", b"payload"],
+            content_length=11,
+            headers={"Content-Type": "image/png"},
+        ),
+    )
+    payload = _image_payload()
+    message_event = kapso._message_event_from_kapso_event(payload)
+    assert message_event is not None
+
+    await kapso._hydrate_media_event(message_event, payload)
+
+    assert message_event.media_urls == ["/tmp/hermes-image.png"]
+    assert cached == [b"\x89PNGpayload"]
