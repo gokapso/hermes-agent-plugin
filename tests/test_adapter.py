@@ -114,6 +114,12 @@ def install_gateway_stubs() -> None:
         async def handle_message(self, event):
             self.handled.append(event)
 
+        async def send_clarify(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
+            # Hermes' numbered-text fallback.
+            self.text_clarifies = getattr(self, "text_clarifies", [])
+            self.text_clarifies.append((chat_id, question, choices, clarify_id, session_key, metadata))
+            return SendResult(success=True, message_id="wamid.text-clarify")
+
     gateway_config.Platform = Platform
     gateway_config.PlatformConfig = PlatformConfig
     gateway_base.BasePlatformAdapter = BasePlatformAdapter
@@ -661,6 +667,295 @@ async def test_send_posts_text_to_kapso_proxy() -> None:
     assert kwargs["headers"]["X-API-Key"] == "key"
     assert kwargs["json"]["to"] == "15551234567"
     assert kwargs["json"]["text"]["body"] == "Hello *world* docs (https://example.com)"
+
+
+class FakeClarifyGateway(types.ModuleType):
+    """Stand-in for Hermes' tools.clarify_gateway; insertion order is clarify age."""
+
+    def __init__(self):
+        super().__init__("tools.clarify_gateway")
+        self.entries = {}
+        self.awaiting = []
+
+    def add(self, clarify_id, *, choices=("A", "B", "C"), multi_select=False, session_key="session-1"):
+        self.entries[clarify_id] = types.SimpleNamespace(
+            clarify_id=clarify_id, session_key=session_key, choices=list(choices), multi_select=multi_select
+        )
+
+    def get_pending(self, clarify_id):
+        return self.entries.get(clarify_id)
+
+    def get_pending_for_session(self, session_key, *, include_choice_prompts=False):
+        return next((e for e in self.entries.values() if e.session_key == session_key), None)
+
+    def mark_awaiting_text(self, clarify_id):
+        self.awaiting.append(clarify_id)
+        return clarify_id in self.entries
+
+
+def install_clarify_gateway(monkeypatch, gateway=None):
+    gateway = gateway or FakeClarifyGateway()
+    tools = types.ModuleType("tools")
+    tools.clarify_gateway = gateway
+    monkeypatch.setitem(sys.modules, "tools", tools)
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", gateway)
+    return gateway
+
+
+USER = "15551234567"
+
+
+def clarify_adapter(*responses):
+    kapso = adapter.KapsoAdapter(make_config(api_key="key", webhook_secret="secret", phone_number_id="pn-1"))
+    kapso._session = FakePostSession(list(responses) or [FakePostResponse({"messages": [{"id": "wamid.c"}]})])
+    return kapso
+
+
+async def send_clarify(kapso, choices, clarify_id="c1"):
+    return await kapso.send_clarify(USER, "Deploy where?", choices, clarify_id, "session-1")
+
+
+def reply_id(clarify_id, number, recipient=USER, phone_number_id="pn-1"):
+    binding = adapter._clarify_binding(clarify_id, phone_number_id, recipient)
+    return f"hermes-clarify:{clarify_id}:{binding}:{number}"
+
+
+def utf16(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def assert_meta_interactive_limits(interactive):
+    body = interactive["body"]["text"]
+    assert utf16(interactive["footer"]["text"]) <= 60
+    if interactive["type"] == "button":
+        options = [button["reply"] for button in interactive["action"]["buttons"]]
+        assert 1 <= len(options) <= 3 and 1 <= utf16(body) <= 1024
+        assert all(1 <= utf16(o["title"]) <= 20 and len(o["id"]) <= 256 for o in options)
+    else:
+        sections = interactive["action"]["sections"]
+        options = [row for section in sections for row in section["rows"]]
+        assert 1 <= len(options) <= 10 and 1 <= utf16(body) <= 4096
+        assert 1 <= utf16(interactive["action"]["button"]) <= 20
+        assert all(utf16(section["title"]) <= 24 for section in sections)
+        assert all(1 <= utf16(o["title"]) <= 24 and len(o["id"]) <= 200 for o in options)
+        assert all(utf16(o.get("description", "")) <= 72 for o in options)
+    assert len({o["title"] for o in options}) == len(options)
+    return options
+
+
+async def test_clarify_with_up_to_three_choices_sends_numbered_reply_buttons(monkeypatch) -> None:
+    for choices in (["Staging"], ["Staging", "Production (Recommended)", "Cancel"]):
+        gateway = install_clarify_gateway(monkeypatch)
+        gateway.add("c1", choices=choices)
+        kapso = clarify_adapter()
+
+        result = await send_clarify(kapso, choices)
+
+        assert result.success is True and result.message_id == "wamid.c"
+        url, kwargs = kapso._session.calls[0]
+        assert url == "https://api.kapso.ai/meta/whatsapp/v24.0/pn-1/messages"
+        payload = kwargs["json"]
+        assert payload["to"] == USER and payload["type"] == "interactive"
+        assert payload["interactive"]["type"] == "button"
+        buttons = assert_meta_interactive_limits(payload["interactive"])
+        numbers = [str(n) for n in range(1, len(choices) + 1)]
+        assert [b["title"] for b in buttons] == numbers
+        assert [b["id"] for b in buttons] == [reply_id("c1", n) for n in numbers]
+        assert payload["interactive"]["body"]["text"].splitlines()[2:] == [
+            f"{n}. {choice}" for n, choice in enumerate(choices, start=1)
+        ]
+        assert gateway.awaiting == ["c1"]
+        assert not getattr(kapso, "text_clarifies", [])
+
+
+async def test_clarify_with_four_to_ten_choices_sends_a_numbered_list(monkeypatch) -> None:
+    for count in (4, 10):
+        choices = [f"Region {n}" for n in range(1, count + 1)]
+        gateway = install_clarify_gateway(monkeypatch)
+        gateway.add("c1", choices=choices)
+        kapso = clarify_adapter()
+
+        await send_clarify(kapso, choices)
+
+        interactive = kapso._session.calls[0][1]["json"]["interactive"]
+        assert interactive["type"] == "list"
+        rows = assert_meta_interactive_limits(interactive)
+        assert [(r["title"], r["description"]) for r in rows] == [
+            (str(n), f"Region {n}") for n in range(1, count + 1)
+        ]
+        assert gateway.awaiting == ["c1"]
+
+
+async def test_clarify_numbering_matches_hermes_without_filtering(monkeypatch) -> None:
+    choices = ["Same", "", "Same", "**Bold** choice", "Long " + "🙂" * 60]
+    install_clarify_gateway(monkeypatch).add("c1", choices=choices)
+    kapso = clarify_adapter()
+
+    await send_clarify(kapso, choices)
+
+    interactive = kapso._session.calls[0][1]["json"]["interactive"]
+    rows = assert_meta_interactive_limits(interactive)
+    assert [r["title"] for r in rows] == ["1", "2", "3", "4", "5"]
+    assert rows[0]["description"] == rows[2]["description"] == "Same"
+    assert "description" not in rows[1]
+    assert rows[3]["description"] == "*Bold* choice"
+    assert rows[4]["description"].endswith("…") and utf16(rows[4]["description"]) <= 72
+    assert interactive["body"]["text"].splitlines()[2:] == [
+        "1. Same", "2. ", "3. Same", "4. *Bold* choice", "5. Long " + "🙂" * 60
+    ]
+
+
+async def test_clarify_falls_back_to_hermes_text_when_buttons_do_not_fit(monkeypatch) -> None:
+    cases = {
+        "no choices": {"choices": None},
+        "11 choices": {"choices": [f"Option {n}" for n in range(1, 12)]},
+        "multi-select": {"choices": ["A", "B"], "multi_select": True},
+        "answered or unknown clarify": {"choices": ["A", "B"], "pending": False},
+        "button body over 1024": {"choices": ["x" * 600, "y" * 600]},
+        "list body over 4096": {"choices": ["z" * 900] * 5},
+        "reply id over 200": {"choices": ["A", "B"], "clarify_id": "c" * 200},
+        "clarify id with a colon": {"choices": ["A", "B"], "clarify_id": "c:1"},
+    }
+    for name, case in cases.items():
+        gateway = install_clarify_gateway(monkeypatch)
+        clarify_id = case.get("clarify_id", "c1")
+        if case.get("pending", True):
+            gateway.add(clarify_id, choices=case["choices"] or (), multi_select=case.get("multi_select", False))
+        kapso = clarify_adapter()
+
+        result = await send_clarify(kapso, case["choices"], clarify_id)
+
+        assert result.message_id == "wamid.text-clarify", name
+        assert kapso._session.calls == [], name
+        assert kapso.text_clarifies == [
+            (USER, "Deploy where?", case["choices"], clarify_id, "session-1", None)
+        ], name
+
+
+async def test_clarify_rejected_by_whatsapp_is_resent_as_text(monkeypatch) -> None:
+    install_clarify_gateway(monkeypatch).add("c1", choices=["A", "B"])
+    kapso = clarify_adapter(FakePostResponse({"error": {"code": 131009}}, status=400))
+
+    result = await send_clarify(kapso, ["A", "B"])
+
+    assert len(kapso._session.calls) == 1
+    assert kapso._session.calls[0][1]["json"]["type"] == "interactive"
+    assert result.message_id == "wamid.text-clarify"
+    assert kapso.text_clarifies == [(USER, "Deploy where?", ["A", "B"], "c1", "session-1", None)]
+
+
+async def test_clarify_ambiguous_failures_are_reported_without_resending(monkeypatch) -> None:
+    class FailingSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            raise ConnectionResetError("connection reset")
+
+    for session in (FakePostSession([FakePostResponse({"error": "upstream"}, status=502)]), FailingSession()):
+        install_clarify_gateway(monkeypatch).add("c1", choices=["A", "B"])
+        kapso = clarify_adapter()
+        kapso._session = session
+
+        result = await send_clarify(kapso, ["A", "B"])
+
+        assert result.success is False and result.retryable is True
+        assert len(session.calls) == 1
+        assert not getattr(kapso, "text_clarifies", [])
+
+
+def clarify_tap_event(reply, sender=USER, kind="button_reply", phone_number_id="pn-1"):
+    return {
+        "event": "whatsapp.message.received",
+        "phone_number_id": phone_number_id,
+        "message": {
+            "id": "wamid.tap",
+            "from": sender,
+            "type": "interactive",
+            "timestamp": "1710000000",
+            "interactive": {"type": kind, kind: reply},
+        },
+        "conversation": {"id": "conv-1", "phone_number": sender},
+    }
+
+
+def test_clarify_taps_reach_hermes_only_for_the_senders_pending_prompt(monkeypatch) -> None:
+    gateway = install_clarify_gateway(monkeypatch)
+    gateway.add("older")
+    gateway.add("newer")
+    kapso = clarify_adapter()
+    other = "15559990000"
+    tap = reply_id("older", "2")
+    forged = tap.split(":")
+    forged[2] = "0" * 16
+    # A genuine tag from the other sender's own prompt, moved onto this clarify's id.
+    own_binding_on_older = reply_id("theirs", "2", other).replace(":theirs:", ":older:")
+    cases = [
+        ("current prompt, button", clarify_tap_event({"id": tap, "title": "2"}), "2"),
+        ("current prompt, list row", clarify_tap_event({"id": tap, "title": "2"}, kind="list_reply"), "2"),
+        ("newer prompt while an older one is pending", clarify_tap_event({"id": reply_id("newer", "1"), "title": "1"}), None),
+        ("answered or expired prompt", clarify_tap_event({"id": reply_id("gone", "1"), "title": "1"}), None),
+        ("another sender replays the tap", clarify_tap_event({"id": tap, "title": "2"}, sender=other), None),
+        ("own binding with another clarify id", clarify_tap_event({"id": own_binding_on_older, "title": "2"}, sender=other), None),
+        ("guessed binding", clarify_tap_event({"id": ":".join(forged), "title": "2"}), None),
+        ("another business number", clarify_tap_event({"id": tap, "title": "2"}, phone_number_id="pn-2"), None),
+        ("title differs from the id", clarify_tap_event({"id": tap, "title": "3"}), None),
+        ("missing title", clarify_tap_event({"id": tap}), None),
+        ("number beyond the choices", clarify_tap_event({"id": reply_id("older", "9"), "title": "9"}), None),
+        ("leading zero", clarify_tap_event({"id": reply_id("older", "02"), "title": "02"}), None),
+        ("no binding or number", clarify_tap_event({"id": "hermes-clarify:older", "title": "2"}), None),
+        ("extra field", clarify_tap_event({"id": tap + ":x", "title": "2"}), None),
+        ("unrelated button", clarify_tap_event({"id": "order:42:confirm", "title": "Confirm"}), "Confirm"),
+        ("reply without an id", clarify_tap_event({"title": "Yes"}), "Yes"),
+    ]
+    for name, event, expected in cases:
+        message_event = kapso._message_event_from_kapso_event(event)
+        assert (message_event.text if message_event else None) == expected, name
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("clarify state unavailable")
+
+    monkeypatch.setattr(gateway, "get_pending_for_session", broken)
+    assert kapso._message_event_from_kapso_event(clarify_tap_event({"id": tap, "title": "2"})) is None
+    monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", None)
+    assert kapso._message_event_from_kapso_event(clarify_tap_event({"id": tap, "title": "2"})) is None
+    assert kapso._message_event_from_kapso_event(clarify_tap_event({"id": "order:1", "title": "OK"})).text == "OK"
+
+
+async def test_clarify_supports_older_hermes_clarify_gateway(monkeypatch) -> None:
+    # Before v0.22.3 there is no get_pending(), and before v2026.7.1 get_pending_for_session()
+    # takes no keyword arguments.
+    class OlderGateway(types.ModuleType):
+        def __init__(self):
+            super().__init__("tools.clarify_gateway")
+            self._entries = {}
+            self.awaiting = []
+
+        def get_pending_for_session(self, session_key):
+            return next((e for e in self._entries.values() if not e.event.is_set()), None)
+
+        def mark_awaiting_text(self, clarify_id):
+            self.awaiting.append(clarify_id)
+            return True
+
+    def entry(clarify_id, answered=False):
+        event = types.SimpleNamespace(is_set=lambda: answered)
+        return types.SimpleNamespace(clarify_id=clarify_id, session_key="session-1", choices=["A", "B"], event=event)
+
+    gateway = install_clarify_gateway(monkeypatch, OlderGateway())
+    gateway._entries = {"done": entry("done", answered=True), "c1": entry("c1")}
+    kapso = clarify_adapter()
+
+    await send_clarify(kapso, ["A", "B"])
+
+    assert kapso._session.calls[0][1]["json"]["interactive"]["type"] == "button"
+    assert gateway.awaiting == ["c1"]
+    tap = clarify_tap_event({"id": reply_id("c1", "2"), "title": "2"})
+    assert kapso._message_event_from_kapso_event(tap).text == "2"
+    stale = clarify_tap_event({"id": reply_id("done", "2"), "title": "2"})
+    assert kapso._message_event_from_kapso_event(stale) is None
 
 
 async def test_send_image_file_uploads_and_sends_media(monkeypatch, tmp_path) -> None:

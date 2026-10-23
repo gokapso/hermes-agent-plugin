@@ -389,6 +389,70 @@ class KapsoAdapter(BasePlatformAdapter):
             raw_response=raw_responses,
         )
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send clarify choices as numbered reply buttons (1-3) or a list (4-10).
+
+        A tap arrives as its number, which Hermes resolves as if typed. Anything else, including a
+        4xx rejection, uses Hermes' numbered-text fallback.
+        """
+        gateway = _clarify_gateway()
+        entry = _pending_clarify(gateway, clarify_id) if choices else None
+        resolved = self._resolve_chat_id(chat_id) if entry is not None else None
+        interactive = None
+        if entry is not None and not getattr(entry, "multi_select", False) and self._session and resolved and resolved[0]:
+            interactive = _clarify_interactive(
+                question, choices, clarify_id, _clarify_binding(clarify_id, *resolved)
+            )
+        if interactive is None:
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata=metadata
+            )
+
+        gateway.mark_awaiting_text(clarify_id)
+        phone_number_id, recipient = resolved
+        result = await _post_kapso_message(
+            session=self._session,
+            base_url=self.base_url,
+            graph_version=self.graph_version,
+            api_key=self.api_key,
+            phone_number_id=phone_number_id,
+            payload={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": recipient,
+                "type": "interactive",
+                "interactive": interactive,
+            },
+        )
+        if not result.get("error"):
+            return SendResult(
+                success=True,
+                message_id=result.get("message_id"),
+                raw_response=result.get("raw"),
+            )
+        status = result.get("status")
+        if status is not None and 400 <= status < 500:
+            # Definitely not delivered: resend as text. Transport errors and 5xx may have been
+            # delivered, so they are reported instead of risking a duplicate prompt.
+            logger.warning("[kapso] interactive clarify rejected (HTTP %s); sending as text", status)
+            return await super().send_clarify(
+                chat_id, question, choices, clarify_id, session_key, metadata=metadata
+            )
+        return SendResult(
+            success=False,
+            error=str(result["error"]),
+            raw_response=result.get("raw"),
+            retryable=bool(result.get("retryable")),
+        )
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -666,6 +730,9 @@ class KapsoAdapter(BasePlatformAdapter):
             "whatsapp_conversation_id",
         )
         contact_name = _contact_name(message, conversation, wa_id)
+        if _rejects_clarify_tap(message, phone_number_id, wa_id):
+            logger.info("[kapso] ignoring a clarify tap that does not answer this sender's pending prompt")
+            return None
         text = _message_text(message)
         message_type = _message_type(message)
         chat_id = encode_kapso_chat_id(phone_number_id, wa_id, conversation_id)
@@ -1739,6 +1806,25 @@ async def _send_text_via_kapso(
         "type": "text",
         "text": {"body": body, "preview_url": True},
     }
+    return await _post_kapso_message(
+        session=session,
+        base_url=base_url,
+        graph_version=graph_version,
+        api_key=api_key,
+        phone_number_id=phone_number_id,
+        payload=payload,
+    )
+
+
+async def _post_kapso_message(
+    *,
+    session,
+    base_url: str,
+    graph_version: str,
+    api_key: str,
+    phone_number_id: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
     url = _messages_url(base_url, graph_version, phone_number_id)
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
     try:
@@ -1753,12 +1839,150 @@ async def _send_text_via_kapso(
                     "error": f"Kapso API HTTP {response.status}: {_compact(raw)}",
                     "raw": raw,
                     "retryable": response.status >= 500,
+                    "status": response.status,
                 }
             return {"success": True, "message_id": _message_id_from_response(raw), "raw": raw}
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         return {"error": str(exc), "retryable": True}
+
+
+# WhatsApp interactive limits (reply buttons / list messages) and the clarify reply-id namespace.
+CLARIFY_REPLY_ID_PREFIX = "hermes-clarify:"
+MAX_REPLY_BUTTONS = 3
+MAX_LIST_ROWS = 10
+MAX_BUTTON_BODY_LENGTH = 1024
+MAX_LIST_BODY_LENGTH = 4096
+MAX_LIST_ROW_DESCRIPTION_LENGTH = 72
+MAX_REPLY_ID_LENGTH = 200
+CLARIFY_FOOTER_TEXT = "Tap a number or type your answer"
+CLARIFY_LIST_BUTTON_TEXT = "Choose"
+CLARIFY_LIST_SECTION_TITLE = "Options"
+_CLARIFY_BINDING_KEY = secrets.token_bytes(32)
+
+
+def _clarify_interactive(
+    question: Any, choices: List[Any], clarify_id: str, binding: str
+) -> Optional[Dict[str, Any]]:
+    """Interactive payload with options titled by Hermes' numbering, or None if it cannot fit.
+
+    Reply ids are ``hermes-clarify:<clarify_id>:<binding>:<number>``.
+    """
+    count = len(choices)
+    if not 1 <= count <= MAX_LIST_ROWS or not clarify_id or ":" in clarify_id:
+        return None
+    reply_ids = [f"{CLARIFY_REPLY_ID_PREFIX}{clarify_id}:{binding}:{n}" for n in range(1, count + 1)]
+    if any(len(reply_id) > MAX_REPLY_ID_LENGTH for reply_id in reply_ids):
+        return None
+    labels = [_to_whatsapp_text(str(choice)) for choice in choices]
+    lines = [f"{n}. {label}" for n, label in enumerate(labels, start=1)]
+    body = "\n".join([_to_whatsapp_text(str(question or "")), "", *lines]).strip()
+    footer = {"text": CLARIFY_FOOTER_TEXT}
+    if count <= MAX_REPLY_BUTTONS:
+        if _utf16_length(body) > MAX_BUTTON_BODY_LENGTH:
+            return None
+        buttons = [
+            {"type": "reply", "reply": {"id": reply_id, "title": str(n)}}
+            for n, reply_id in enumerate(reply_ids, start=1)
+        ]
+        return {"type": "button", "body": {"text": body}, "footer": footer, "action": {"buttons": buttons}}
+    if _utf16_length(body) > MAX_LIST_BODY_LENGTH:
+        return None
+    rows = []
+    for n, (reply_id, label) in enumerate(zip(reply_ids, labels), start=1):
+        row: Dict[str, str] = {"id": reply_id, "title": str(n)}
+        description = _truncate_utf16(" ".join(label.split()), MAX_LIST_ROW_DESCRIPTION_LENGTH)
+        if description:
+            row["description"] = description
+        rows.append(row)
+    return {
+        "type": "list",
+        "body": {"text": body},
+        "footer": footer,
+        "action": {
+            "button": CLARIFY_LIST_BUTTON_TEXT,
+            "sections": [{"title": CLARIFY_LIST_SECTION_TITLE, "rows": rows}],
+        },
+    }
+
+
+def _utf16_length(text: str) -> int:
+    """Length as WhatsApp counts it (UTF-16 code units), so emoji are not undercounted."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(text: str, limit: int) -> str:
+    if _utf16_length(text) <= limit:
+        return text
+    while text and _utf16_length(text) > limit - 1:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _clarify_gateway() -> Any:
+    try:
+        from tools import clarify_gateway
+    except ImportError:  # pragma: no cover - always present in Hermes runtimes
+        return None
+    return clarify_gateway
+
+
+def _pending_clarify(gateway: Any, clarify_id: str) -> Any:
+    """Hermes' pending entry for ``clarify_id``, or None once answered, expired or unknown."""
+    if gateway is None:
+        return None
+    get_pending = getattr(gateway, "get_pending", None)  # Hermes v0.22.3+
+    if callable(get_pending):
+        return get_pending(clarify_id)
+    entry = getattr(gateway, "_entries", {}).get(clarify_id)  # what older Hermes' fallback reads
+    event = getattr(entry, "event", None)
+    if entry is None or (event is not None and event.is_set()):
+        return None
+    return entry
+
+
+def _clarify_binding(clarify_id: str, phone_number_id: str, recipient: str) -> str:
+    """Tag tying reply ids to one clarify, business number and recipient (per-process key)."""
+    identity = f"{clarify_id}:{phone_number_id}:{_normalize_phone(recipient) or recipient}"
+    return hmac.new(_CLARIFY_BINDING_KEY, identity.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def _rejects_clarify_tap(message: Dict[str, Any], phone_number_id: str, sender: str) -> bool:
+    """True when a ``hermes-clarify:`` tap must not reach Hermes (other replies are untouched).
+
+    Hermes resolves the tapped number against the session's oldest pending clarify, so a tap only
+    passes if it is well formed, was sent to this sender, and its clarify is that entry. Anything
+    that cannot be checked is dropped.
+    """
+    reply = _interactive_reply(message)
+    reply_id = _read_str(reply, "id") or ""
+    if not reply_id.startswith(CLARIFY_REPLY_ID_PREFIX):
+        return False
+    parts = reply_id[len(CLARIFY_REPLY_ID_PREFIX):].split(":")
+    if len(parts) != 3:
+        return True
+    clarify_id, binding, number = parts
+    if (
+        not clarify_id
+        or number not in {str(n) for n in range(1, MAX_LIST_ROWS + 1)}
+        or _read_str(reply, "title") != number
+        or not hmac.compare_digest(binding, _clarify_binding(clarify_id, phone_number_id, sender))
+    ):
+        return True
+    gateway = _clarify_gateway()
+    try:
+        entry = _pending_clarify(gateway, clarify_id)
+        if entry is None or int(number) > len(getattr(entry, "choices", None) or []):
+            return True
+        try:
+            current = gateway.get_pending_for_session(entry.session_key, include_choice_prompts=True)
+        except TypeError:  # Hermes before v2026.7.1
+            current = gateway.get_pending_for_session(entry.session_key)
+    except Exception:
+        logger.exception("[kapso] could not check clarify state; ignoring the tap")
+        return True
+    return getattr(current, "clarify_id", None) != clarify_id
 
 
 async def _send_media_file_via_kapso(

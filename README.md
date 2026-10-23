@@ -273,6 +273,18 @@ Other local files are sent as WhatsApp `document` messages. WhatsApp stickers ar
 supported only when explicitly sent as sticker media; Hermes `MEDIA:/path.webp`
 attachments are treated as images by Hermes.
 
+## Clarify Choices
+
+When a Hermes agent asks a clarifying question with choices, the plugin sends them as
+WhatsApp reply buttons (1–3 choices) or a list (4–10). Each option is labelled with its
+number and the full text is shown in the message, so tapping an option counts as typing
+its number. Typed answers keep working.
+
+Multi-select questions, questions with more than 10 choices, and text too long for
+WhatsApp's limits are sent as a numbered text list instead. Taps on an expired prompt,
+or on a newer prompt while an earlier one is still waiting, are ignored; answer the
+earlier prompt first.
+
 ## Config YAML
 
 Environment variables are the easiest path, but this also works:
